@@ -800,7 +800,7 @@ export default function Dashboard() {
 
         {/* Sección de Tendencia de avance y Actividad */}
         {historial.length >= 2 ? (
-          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginBottom: 32 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(0, 1fr)", gap: 16, marginBottom: 32 }}>
             <TendenciaChart historial={historial} grande={modoPresentacion} actividadPorDia={actividadPorDia} />
             <ActividadHeatmap actividadPorDia={actividadPorDia} diasCustom={rangoDiasHeatmap} grande={modoPresentacion} onMarcarCompleta={handleMarcarCompleta} marcandoId={marcandoId} />
           </div>
@@ -917,7 +917,7 @@ export default function Dashboard() {
         )}
 
         {!modoPresentacion && (
-        <div className="chijnaya-modo-transicion" style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 24 }}>
+        <div className="chijnaya-modo-transicion" style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.3fr) minmax(0, 1fr)", gap: 24 }}>
           <div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
               <h2 style={{ fontSize: 16, color: "#dceeec", margin: 0 }}>
@@ -1737,7 +1737,7 @@ function TendenciaChart({ historial, grande, actividadPorDia }) {
           const pasoEtiqueta = 1;
 
           return (
-            <div style={{ overflowX: "auto", overflowY: "hidden", width: "100%", paddingBottom: 8, scrollbarWidth: "thin", scrollbarColor: "#2b5c5c #0e2529" }}>
+            <div ref={(el) => { if (el && !el.dataset.scrolled) { el.scrollLeft = el.scrollWidth; el.dataset.scrolled = "1"; } }} style={{ overflowX: "auto", overflowY: "hidden", width: "100%", paddingBottom: 8, scrollbarWidth: "thin", scrollbarColor: "#2b5c5c #0e2529" }}>
               <svg viewBox={`0 0 ${ancho} ${alto}`} style={{ width: `${ancho}px`, height: `${alto}px`, display: "block" }}>
                 {[0, 25, 50, 75, 100].map((v) => {
                   const y = paddingArriba + altoLinea - paddingArriba - (v / 100) * (altoLinea - paddingArriba * 2);
