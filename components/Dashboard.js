@@ -12,19 +12,17 @@ import {
   where,
   getDocs,
 } from "firebase/firestore";
-import { generarReportePorArea } from "@/lib/exportarReporte";
-import { generarReporteExcelPorArea } from "@/lib/exportarExcel";
-import { generarIndiceGeneralExcel } from "@/lib/exportarIndiceGeneral";
+import { generarReportePorArea, generarReporteConsolidadoGlobal } from "@/lib/exportarReporte";
+import { generarReporteExcelPorArea, generarListaSeparadoresExcel } from "@/lib/exportarExcel";
 import { LOGO_PUNO_BASE64 } from "@/lib/logoPuno";
 import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
   onAuthStateChanged,
-  signOut,
 } from "firebase/auth";
 
-const auth = getAuth(db.app); // misma app de Firebase que ya usa Firestore (db)
+const auth = getAuth(db.app);
 
 const COLLAPSE_STORAGE_KEY = "chijnaya_grupos_colapsados";
 
@@ -92,10 +90,6 @@ const EVENTO_ICONO = {
   carpeta_desmarcada: "↺",
 };
 
-// Convierte "2026-08-19" (o un Date) en "Miércoles 19 de agosto de 2026"
-// Misma lógica que en el servidor (syncEngine.js) — calcula "YYYY-MM-DD" en
-// HORA DE LIMA, para que el calendario del navegador coincida exacto con lo
-// que guardó el servidor, sin importar el huso horario de cada uno.
 function fechaLimaISO(fecha) {
   const partes = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Lima",
@@ -133,21 +127,23 @@ export default function Dashboard() {
   const [carpetas, setCarpetas] = useState([]);
   const [eventos, setEventos] = useState([]);
   const [filtroArea, setFiltroArea] = useState("Todas");
-  const [filtroEstado, setFiltroEstado] = useState("pendientes"); // pendientes | incompleta | vacia | completa | todas
+  const [filtroEstado, setFiltroEstado] = useState("pendientes");
   const [sincronizando, setSincronizando] = useState(false);
   const [mensajeSync, setMensajeSync] = useState(null);
   const [busqueda, setBusqueda] = useState("");
-  const [colapsados, setColapsados] = useState({}); // { [groupKey]: true } => colapsado
-  const [colapsoListo, setColapsoListo] = useState(false); // evita pisar localStorage antes de leerlo
+  const [colapsados, setColapsados] = useState({});
+  const [colapsoListo, setColapsoListo] = useState(false);
   const [exportandoArea, setExportandoArea] = useState(null);
   const [exportandoExcelArea, setExportandoExcelArea] = useState(null);
-  const [exportandoIndiceArea, setExportandoIndiceArea] = useState(null);
+  const [exportandoSeparadores, setExportandoSeparadores] = useState(null);
+  const [exportandoGlobal, setExportandoGlobal] = useState(false);
   const [modoPresentacion, setModoPresentacion] = useState(false);
   const [historial, setHistorial] = useState([]);
   const [actividadPorDia, setActividadPorDia] = useState({});
   const [marcandoId, setMarcandoId] = useState(null);
   const [mostrarMarcadas, setMostrarMarcadas] = useState(false);
-  const [usuarioGoogle, setUsuarioGoogle] = useState(null); // {email, displayName} o null si no inició sesión
+  const [usuarioGoogle, setUsuarioGoogle] = useState(null);
+  const [rangoDiasHeatmap, setRangoDiasHeatmap] = useState(84);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (user) => {
@@ -156,25 +152,19 @@ export default function Dashboard() {
     return () => unsub();
   }, []);
 
-  // Cargar estado de colapso guardado (una sola vez, al montar)
   useEffect(() => {
     try {
       const guardado = localStorage.getItem(COLLAPSE_STORAGE_KEY);
       if (guardado) setColapsados(JSON.parse(guardado));
-    } catch {
-      // localStorage no disponible o corrupto — seguimos con todo expandido
-    }
+    } catch {}
     setColapsoListo(true);
   }, []);
 
-  // Guardar cada vez que cambie (después de la carga inicial)
   useEffect(() => {
     if (!colapsoListo) return;
     try {
       localStorage.setItem(COLLAPSE_STORAGE_KEY, JSON.stringify(colapsados));
-    } catch {
-      // si falla el guardado no rompemos nada, solo no persiste
-    }
+    } catch {}
   }, [colapsados, colapsoListo]);
 
   function toggleGrupo(key) {
@@ -184,16 +174,35 @@ export default function Dashboard() {
   function handleExportarArea(areaNombre, carpetasDelArea) {
     setExportandoArea(areaNombre);
     try {
-      generarReportePorArea(areaNombre, carpetasDelArea);
+      const usuarioFirma = usuarioGoogle?.email || usuarioGoogle?.displayName || "Sistema Chijnaya";
+      generarReportePorArea(areaNombre, carpetasDelArea, { usuarioFirma });
     } finally {
       setExportandoArea(null);
+    }
+  }
+
+  async function handleExportarGlobal() {
+    setExportandoGlobal(true);
+    try {
+      const usuarioFirma = usuarioGoogle?.email || usuarioGoogle?.displayName || "Sistema Chijnaya";
+      generarReporteConsolidadoGlobal(carpetas, { usuarioFirma });
+    } catch (err) {
+      alert(`No se pudo generar el reporte consolidado: ${err.message}`);
+    } finally {
+      setExportandoGlobal(false);
     }
   }
 
   async function handleExportarExcelArea(areaNombre, carpetasDelArea) {
     setExportandoExcelArea(areaNombre);
     try {
-      await generarReporteExcelPorArea(areaNombre, carpetasDelArea);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Tiempo de espera agotado al generar el Excel")), 10000)
+      );
+      await Promise.race([
+        generarReporteExcelPorArea(areaNombre, carpetasDelArea),
+        timeoutPromise,
+      ]);
     } catch (err) {
       alert(`No se pudo generar el Excel: ${err.message}`);
     } finally {
@@ -201,20 +210,26 @@ export default function Dashboard() {
     }
   }
 
-  async function handleExportarIndiceArea(areaNombre, carpetasDelArea) {
-    setExportandoIndiceArea(areaNombre);
+  // Lista de separadores: siempre usa TODAS las carpetas del área, sin
+  // filtro por estado — es un índice de secciones, no un reporte de avance.
+  async function handleExportarSeparadores(areaNombre, carpetasDelArea) {
+    setExportandoSeparadores(areaNombre);
     try {
-      await generarIndiceGeneralExcel(areaNombre, carpetasDelArea);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Tiempo de espera agotado al generar el Excel")), 10000)
+      );
+      await Promise.race([
+        generarListaSeparadoresExcel(areaNombre, carpetasDelArea),
+        timeoutPromise,
+      ]);
     } catch (err) {
-      alert(`No se pudo generar el Índice General: ${err.message}`);
+      alert(`No se pudo generar la lista de separadores: ${err.message}`);
     } finally {
-      setExportandoIndiceArea(null);
+      setExportandoSeparadores(null);
     }
   }
 
   async function handleMarcarCompleta(folderId, forzada, folderName, folderRuta) {
-    // Necesita sesión real de Google — así el nombre/correo que queda registrado
-    // es siempre el verdadero, no algo que alguien escribió a mano.
     let user = auth.currentUser;
     if (!user) {
       try {
@@ -228,17 +243,11 @@ export default function Dashboard() {
 
     let motivo = "";
     if (forzada) {
-      motivo = window.prompt(
-        "¿Por qué se marca como completa? (ej. 'Documento escaneado, no aplica editable') — esto lo van a poder ver los demás evaluadores",
-        ""
-      );
-      if (motivo === null) return; // canceló el prompt
+      motivo = window.prompt("¿Por qué se marca como completa?", "");
+      if (motivo === null) return;
     } else {
-      motivo = window.prompt(
-        "¿Por qué se desmarca? (ej. 'La marqué por error', 'Ya no aplica la excepción') — esto queda registrado en el historial, es opcional",
-        ""
-      );
-      if (motivo === null) return; // canceló el prompt
+      motivo = window.prompt("¿Por qué se desmarca?", "");
+      if (motivo === null) return;
     }
 
     setMarcandoId(folderId);
@@ -287,28 +296,16 @@ export default function Dashboard() {
       setCarpetas(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
 
-    const eventosQuery = query(
-      collection(db, "eventos"),
-      orderBy("timestamp", "desc"),
-      limit(50)
-    );
+    const eventosQuery = query(collection(db, "eventos"), orderBy("timestamp", "desc"), limit(50));
     const unsubEventos = onSnapshot(eventosQuery, (snap) => {
       setEventos(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
 
-    // Actividad para el mapa de calor: se lee UN SOLO documento agregado
-    // (contador por día, guardado por syncEngine) en vez de cientos de eventos
-    // crudos — esto es lo que evita agotar la cuota gratuita de lecturas de Firestore.
     const unsubActividadPorDia = onSnapshot(doc(db, "_meta", "actividadPorDia"), (snap) => {
       setActividadPorDia(snap.exists() ? snap.data() : {});
     });
 
-    // Historial diario (guardado por syncEngine) para el gráfico de tendencia
-    const historialQuery = query(
-      collection(db, "historial"),
-      orderBy("fecha", "asc"),
-      limit(90)
-    );
+    const historialQuery = query(collection(db, "historial"), orderBy("fecha", "asc"), limit(90));
     const unsubHistorial = onSnapshot(historialQuery, (snap) => {
       setHistorial(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
@@ -326,11 +323,8 @@ export default function Dashboard() {
     ? Math.round((resumen.completas / resumen.totalFinales) * 100)
     : 0;
 
-  const areas = Array.from(
-    new Set(carpetas.map((c) => c.area || "Sin área"))
-  ).sort();
+  const areas = Array.from(new Set(carpetas.map((c) => c.area || "Sin área"))).sort();
 
-  // Todas las carpetas de cada área (sin filtros), para exportar el reporte completo del área
   const carpetasPorArea = {};
   for (const c of carpetas) {
     const a = c.area || "Sin área";
@@ -338,16 +332,11 @@ export default function Dashboard() {
     carpetasPorArea[a].push(c);
   }
 
-  // Carpetas marcadas manualmente como completa — para el panel "Marcadas manualmente"
   const carpetasForzadas = carpetas
     .filter((c) => c.forzada)
     .sort((a, b) => new Date(b.marcadoEn || 0) - new Date(a.marcadoEn || 0));
 
-  // Estadisticas por area: total, completas, incompletas, vacias — para el circulo de progreso
   const areaStats = {};
-  // Estadisticas por ESPECIALIDAD, anidadas DENTRO de cada área madre — igual que
-  // el resumen del PDF. Es dinámico: si mañana hay 4 áreas en vez de 3, o cambian
-  // las especialidades de cada una, esto se recalcula solo desde "carpetas".
   const especialidadPorArea = {};
   for (const c of carpetas) {
     const a = c.area || "Sin área";
@@ -364,9 +353,12 @@ export default function Dashboard() {
     const especialidad = partesRuta.length > 1 ? partesRuta[1] : "(raíz)";
     if (!especialidadPorArea[a]) especialidadPorArea[a] = {};
     if (!especialidadPorArea[a][especialidad])
-      especialidadPorArea[a][especialidad] = { total: 0, completas: 0, archivosNecesarios: 0, archivosCompletados: 0 };
+      especialidadPorArea[a][especialidad] = { total: 0, completas: 0, incompletas: 0, vacias: 0, archivosNecesarios: 0, archivosCompletados: 0 };
+    
     especialidadPorArea[a][especialidad].total++;
     if (c.estado === "completa") especialidadPorArea[a][especialidad].completas++;
+    if (c.estado === "incompleta") especialidadPorArea[a][especialidad].incompletas++;
+    if (c.estado === "vacia") especialidadPorArea[a][especialidad].vacias++;
     especialidadPorArea[a][especialidad].archivosNecesarios += c.archivosNecesarios || 0;
     especialidadPorArea[a][especialidad].archivosCompletados += c.archivosCompletados || 0;
   }
@@ -460,8 +452,6 @@ export default function Dashboard() {
         @media (prefers-reduced-motion: reduce) {
           .chijnaya-barra-avance { animation: none; }
         }
-
-        /* Hover profesional en todos los botones — leve elevación + brillo */
         .chijnaya-fondo-animado button:not(:disabled) {
           transition: transform .15s ease, filter .15s ease, box-shadow .15s ease;
         }
@@ -473,8 +463,6 @@ export default function Dashboard() {
           transform: translateY(0) scale(0.98);
           filter: brightness(0.96);
         }
-
-        /* Tarjetas contadoras y paneles: entrada suave con leve "resorte" */
         .chijnaya-tarjeta-viva {
           animation: chijnayaTarjetaEntrada .5s cubic-bezier(.25,.9,.35,1.25) both;
         }
@@ -482,8 +470,6 @@ export default function Dashboard() {
           from { opacity: 0; transform: translateY(10px) scale(.96); }
           to   { opacity: 1; transform: translateY(0) scale(1); }
         }
-
-        /* Celdas del calendario de actividad: aparecen en cascada, tipo ola */
         .chijnaya-celda-heatmap {
           animation: chijnayaCeldaEntrada .4s ease both;
         }
@@ -497,9 +483,6 @@ export default function Dashboard() {
           box-shadow: 0 0 8px rgba(45,212,191,.6);
           z-index: 70;
         }
-
-        /* La celda de "hoy" pulsa sin parar, para que el calendario se sienta
-           tan "vivo" como la línea de tendencia (antes solo tenía la entrada única) */
         .chijnaya-celda-hoy {
           position: relative;
         }
@@ -516,8 +499,6 @@ export default function Dashboard() {
           0%   { transform: scale(1); opacity: .9; }
           100% { transform: scale(1.9); opacity: 0; }
         }
-
-        /* Transición suave al entrar/salir del modo presentación */
         .chijnaya-modo-transicion {
           animation: chijnayaModoEntrada .35s cubic-bezier(.2,.85,.35,1.15) both;
         }
@@ -525,16 +506,13 @@ export default function Dashboard() {
           from { opacity: 0; transform: scale(.985); }
           to   { opacity: 1; transform: scale(1); }
         }
-
         @media (prefers-reduced-motion: reduce) {
           .chijnaya-tarjeta-viva, .chijnaya-celda-heatmap, .chijnaya-modo-transicion {
             animation: none !important;
           }
-          .chijnaya-fondo-animado button:not(:disabled):hover {
-            transform: none;
-          }
         }
       `}</style>
+
       <div className="chijnaya-header-sticky">
         <div
           style={{
@@ -549,804 +527,765 @@ export default function Dashboard() {
             color: "#eef7f5",
           }}
         >
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <img
-            src={LOGO_PUNO_BASE64}
-            alt="Escudo Gobierno Regional de Puno"
-            style={{ width: modoPresentacion ? 52 : 40, height: modoPresentacion ? 58 : 45, flexShrink: 0 }}
-          />
-          <div>
-            <h1 style={{ fontSize: modoPresentacion ? 36 : 24, marginBottom: 4, fontWeight: 800, letterSpacing: -0.3 }}>Expediente Técnico — C.S. Chijnaya</h1>
-            <p style={{ color: "#b7c9c6", marginTop: 0, marginBottom: 4, fontSize: modoPresentacion ? 16 : 14 }}>
-              Estado en tiempo real de la carga de documentación
-            </p>
-            {resumen?.ultimaSync?.toDate && (
-              <p style={{ color: "#8fa8a8", fontSize: 11, marginTop: 0 }}>
-                Última sincronización: {tiempoRelativo(resumen.ultimaSync.toDate())}
+          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <img
+              src={LOGO_PUNO_BASE64}
+              alt="Escudo Gobierno Regional de Puno"
+              style={{ width: modoPresentacion ? 52 : 40, height: modoPresentacion ? 58 : 45, flexShrink: 0 }}
+            />
+            <div>
+              <h1 style={{ fontSize: modoPresentacion ? 36 : 24, marginBottom: 4, fontWeight: 800, letterSpacing: -0.3 }}>Expediente Técnico — C.S. Chijnaya</h1>
+              <p style={{ color: "#b7c9c6", marginTop: 0, marginBottom: 4, fontSize: modoPresentacion ? 16 : 14 }}>
+                Estado en tiempo real de la carga de documentación
               </p>
-            )}
+              {resumen?.ultimaSync?.toDate && (
+                <p style={{ color: "#8fa8a8", fontSize: 11, marginTop: 0 }}>
+                  Última sincronización: {tiempoRelativo(resumen.ultimaSync.toDate())}
+                  {usuarioGoogle && <span style={{ marginLeft: 8, color: "#2dd4bf" }}>· {usuarioGoogle.email}</span>}
+                </p>
+              )}
+            </div>
           </div>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          {carpetasForzadas.length > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            {carpetasForzadas.length > 0 && (
+              <button
+                onClick={() => setMostrarMarcadas(true)}
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  padding: "14px 18px",
+                  borderRadius: 14,
+                  border: "1.5px solid #2dd4bf66",
+                  background: "#0e2529",
+                  color: "#2dd4bf",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                <span style={{ fontSize: 16 }}>✓</span>
+                Marcadas manualmente ({carpetasForzadas.length})
+              </button>
+            )}
+
             <button
-              onClick={() => setMostrarMarcadas(true)}
+              onClick={handleExportarGlobal}
+              disabled={exportandoGlobal || carpetas.length === 0}
               style={{
                 fontSize: 13,
                 fontWeight: 700,
                 padding: "14px 18px",
                 borderRadius: 14,
-                border: "1.5px solid #2dd4bf66",
-                background: "#0e2529",
-                color: "#2dd4bf",
+                border: "1.5px solid #17a39866",
+                background: exportandoGlobal ? "#122e2e" : "#0e2529",
+                color: exportandoGlobal ? "#8fa8a8" : "#7fe0d4",
+                cursor: exportandoGlobal || carpetas.length === 0 ? "not-allowed" : "pointer",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                whiteSpace: "nowrap",
+              }}
+              title="Generar PDF consolidado de todo el proyecto"
+            >
+              <span style={{ fontSize: 16 }}>📑</span>
+              {exportandoGlobal ? "Generando Global..." : "Reporte Consolidado PDF"}
+            </button>
+
+            <button
+              onClick={() => setModoPresentacion((v) => !v)}
+              style={{
+                fontSize: 14,
+                fontWeight: 700,
+                padding: "14px 20px",
+                borderRadius: 14,
+                border: modoPresentacion ? "2px solid #17a398" : "1.5px solid #2b5c5c",
+                background: modoPresentacion ? "#17a39822" : "#0e2529",
+                color: modoPresentacion ? "#17a398" : "#dceeec",
                 cursor: "pointer",
                 display: "flex",
                 alignItems: "center",
                 gap: 8,
                 whiteSpace: "nowrap",
               }}
-              title="Ver todas las carpetas marcadas manualmente como completas"
             >
-              <span style={{ fontSize: 16 }}>✓</span>
-              Marcadas manualmente ({carpetasForzadas.length})
+              <span style={{ fontSize: 18 }}>🖥</span>
+              {modoPresentacion ? "Salir de presentación" : "Modo presentación"}
             </button>
-          )}
-          <button
-            onClick={() => setModoPresentacion((v) => !v)}
-            style={{
-              fontSize: 14,
-              fontWeight: 700,
-              padding: "14px 20px",
-              borderRadius: 14,
-              border: modoPresentacion ? "2px solid #17a398" : "1.5px solid #2b5c5c",
-              background: modoPresentacion ? "#17a39822" : "#0e2529",
-              color: modoPresentacion ? "#17a398" : "#dceeec",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              whiteSpace: "nowrap",
-            }}
-          >
-            <span style={{ fontSize: 18 }}>🖥</span>
-            {modoPresentacion ? "Salir de presentación" : "Modo presentación"}
-          </button>
-          <div style={{ textAlign: "right" }}>
-          <button
-            onClick={handleSync}
-            disabled={sincronizando}
-            style={{
-              fontSize: 20,
-              fontWeight: 800,
-              padding: "22px 42px",
-              borderRadius: 16,
-              border: "2px solid #17a39888",
-              background: sincronizando ? "#122e2e" : "linear-gradient(90deg,#17a39833,#0e7c7233)",
-              color: sincronizando ? "#9db3b0" : "#7fe0d4",
-              cursor: sincronizando ? "not-allowed" : "pointer",
-              boxShadow: sincronizando ? "none" : "0 0 28px rgba(23,163,152,.4)",
-              letterSpacing: 0.3,
-            }}
-          >
-            {sincronizando ? "⟳ Sincronizando..." : "⟳ Sincronizar ahora"}
-          </button>
-          {mensajeSync && (
-            <p
-              style={{
-                fontSize: 11,
-                marginTop: 6,
-                color: mensajeSync.tipo === "ok" ? "#2ecc71" : "#e74c3c",
-              }}
-            >
-              {mensajeSync.texto}
-            </p>
-          )}
+            <div style={{ textAlign: "right" }}>
+              <button
+                onClick={handleSync}
+                disabled={sincronizando}
+                style={{
+                  fontSize: 20,
+                  fontWeight: 800,
+                  padding: "22px 42px",
+                  borderRadius: 16,
+                  border: "2px solid #17a39888",
+                  background: sincronizando ? "#122e2e" : "linear-gradient(90deg,#17a39833,#0e7c7233)",
+                  color: sincronizando ? "#9db3b0" : "#7fe0d4",
+                  cursor: sincronizando ? "not-allowed" : "pointer",
+                  boxShadow: sincronizando ? "none" : "0 0 28px rgba(23,163,152,.4)",
+                  letterSpacing: 0.3,
+                }}
+              >
+                {sincronizando ? "⟳ Sincronizando..." : "⟳ Sincronizar ahora"}
+              </button>
+              {mensajeSync && (
+                <p
+                  style={{
+                    fontSize: 11,
+                    marginTop: 6,
+                    color: mensajeSync.tipo === "ok" ? "#2ecc71" : "#e74c3c",
+                  }}
+                >
+                  {mensajeSync.texto}
+                </p>
+              )}
+            </div>
           </div>
-        </div>
         </div>
       </div>
 
       <div style={{ maxWidth: modoPresentacion ? "100%" : 1500, margin: "0 auto", padding: modoPresentacion ? "24px 48px 36px" : "24px 28px 32px", color: "#eef7f5" }}>
 
-      {/* Barra de progreso — estilo "barra de energía", debe resaltar sobre el resto */}
-      <div
-        style={{
-          marginBottom: 20,
-          background: "rgba(8,28,31,.75)",
-          backdropFilter: "blur(6px)",
-          borderRadius: 12,
-          padding: "16px 18px",
-          border: "1px solid #1f4a4a",
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-          <span style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", letterSpacing: 0.5 }}>
-            <span style={{ color: "#17a398" }}>»» </span>AVANCE POR CARPETAS
-          </span>
-          <strong style={{ fontSize: 30, textShadow: "0 0 18px rgba(23,163,152,.6)" }}>{pct}%</strong>
-        </div>
-        <div style={{ fontSize: 11, color: "#8fa8a8", marginBottom: 8 }}>
-          {resumen?.completas ?? "–"} de {resumen?.totalFinales ?? "–"} carpetas marcadas como completas
-        </div>
+        {/* Barra de progreso */}
         <div
           style={{
-            height: 34,
-            background: "#0a1e20",
-            borderRadius: 17,
-            overflow: "hidden",
-            boxShadow: "inset 0 2px 6px rgba(0,0,0,.5), 0 0 0 1px #1f4a4a",
+            marginBottom: 20,
+            background: "rgba(8,28,31,.75)",
+            backdropFilter: "blur(6px)",
+            borderRadius: 12,
+            padding: "16px 18px",
+            border: "1px solid #1f4a4a",
           }}
         >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+            <span style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", letterSpacing: 0.5 }}>
+              <span style={{ color: "#17a398" }}>»» </span>AVANCE POR CARPETAS
+            </span>
+            <strong style={{ fontSize: 30, textShadow: "0 0 18px rgba(23,163,152,.6)" }}>{pct}%</strong>
+          </div>
+          <div style={{ fontSize: 11, color: "#8fa8a8", marginBottom: 8 }}>
+            {resumen?.completas ?? "–"} de {resumen?.totalFinales ?? "–"} carpetas marcadas como completas
+          </div>
           <div
-            className="chijnaya-barra-avance"
             style={{
-              width: `${pct}%`,
-              height: "100%",
-              backgroundImage:
-                "repeating-linear-gradient(45deg, rgba(255,255,255,.18) 0px, rgba(255,255,255,.18) 9px, transparent 9px, transparent 18px), linear-gradient(90deg,#17a398,#0e7c72)",
-              backgroundSize: "36px 36px, 100% 100%",
-              transition: "width .4s ease",
-              boxShadow: "0 0 22px rgba(14,124,114,.65)",
+              height: 34,
+              background: "#0a1e20",
               borderRadius: 17,
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Segunda barra: avance REAL a nivel de archivo, se mueve gradualmente
-          archivo por archivo en vez de saltar de golpe carpeta por carpeta */}
-      <div
-        style={{
-          marginBottom: 32,
-          background: "rgba(8,28,31,.75)",
-          backdropFilter: "blur(6px)",
-          borderRadius: 12,
-          padding: "16px 18px",
-          border: "1px solid #1f4a4a",
-        }}
-      >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
-          <span style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", letterSpacing: 0.5 }}>
-            <span style={{ color: "#2dd4bf" }}>»» </span>AVANCE POR ARCHIVOS <span style={{ fontSize: 11, color: "#8fa8a8", fontWeight: 400 }}>(más preciso)</span>
-          </span>
-          <strong style={{ fontSize: 30, color: "#2dd4bf", textShadow: "0 0 18px rgba(45,212,191,.6)" }}>
-            {resumen?.pctArchivos ?? "–"}%
-          </strong>
-        </div>
-        <div style={{ fontSize: 11, color: "#8fa8a8", marginBottom: 8 }}>
-          {resumen?.totalArchivosCompletados ?? "–"} de {resumen?.totalArchivosNecesarios ?? "–"} archivos que hacen falta, ya están subidos
-          (cuenta cada PDF/editable, no solo si la carpeta está 100% o no)
-        </div>
-        <div
-          style={{
-            height: 22,
-            background: "#0a1e20",
-            borderRadius: 11,
-            overflow: "hidden",
-            boxShadow: "inset 0 2px 6px rgba(0,0,0,.5), 0 0 0 1px #1f4a4a",
-          }}
-        >
-          <div
-            style={{
-              width: `${resumen?.pctArchivos ?? 0}%`,
-              height: "100%",
-              background: "linear-gradient(90deg,#2dd4bf,#0d9488)",
-              transition: "width .4s ease",
-              boxShadow: "0 0 16px rgba(45,212,191,.5)",
-              borderRadius: 11,
-            }}
-          />
-        </div>
-      </div>
-
-      {/* Contadores */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 32 }}>
-        <Card label="Carpetas finales" value={resumen?.totalFinales ?? "–"} color="#17a398" grande={modoPresentacion} />
-        <Card label="Completas" value={resumen?.completas ?? "–"} color="#2ecc71" grande={modoPresentacion} />
-        <Card label="Incompletas" value={resumen?.incompletas ?? "–"} color="#f39c12" grande={modoPresentacion} />
-        <Card label="Vacías" value={resumen?.vacias ?? "–"} color="#e74c3c" grande={modoPresentacion} />
-      </div>
-
-      {/* Tendencia de avance + mapa de calor de actividad */}
-      {historial.length >= 2 ? (
-        <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginBottom: 32 }}>
-          <TendenciaChart historial={historial} grande={modoPresentacion} actividadPorDia={actividadPorDia} />
-          <ActividadHeatmap actividadPorDia={actividadPorDia} grande={modoPresentacion} onMarcarCompleta={handleMarcarCompleta} marcandoId={marcandoId} />
-        </div>
-      ) : (
-        <div style={{ marginBottom: 32 }}>
-          <ActividadHeatmap actividadPorDia={actividadPorDia} grande={modoPresentacion} onMarcarCompleta={handleMarcarCompleta} marcandoId={marcandoId} />
-        </div>
-      )}
-
-      {modoPresentacion && (
-        <div
-          className="chijnaya-fade-in chijnaya-modo-transicion"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-            gap: 28,
-            justifyItems: "center",
-            marginTop: 8,
-          }}
-        >
-          {areas.map((a) => {
-            const stats = areaStats[a] || { total: 0, completas: 0, archivosNecesarios: 0, archivosCompletados: 0 };
-            const pctArea =
-              stats.archivosNecesarios > 0
-                ? Math.round((stats.archivosCompletados / stats.archivosNecesarios) * 100)
-                : 0;
-            return (
-              <AreaMiniCard
-                key={a}
-                area={a}
-                pct={pctArea}
-                total={stats.total}
-                color={colorForArea(a)}
-                active={false}
-                onClick={() => {}}
-                tamano={260}
-              />
-            );
-          })}
-        </div>
-      )}
-
-      {modoPresentacion && areas.length > 0 && (
-        <div className="chijnaya-fade-in chijnaya-modo-transicion" style={{ marginTop: 36 }}>
-          <div style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", marginBottom: 20, display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ color: "#2dd4bf" }}>»» </span>AVANCE POR ESPECIALIDAD, POR ÁREA
-          </div>
-          {areas.map((a) => {
-            const especialidadesDelArea = especialidadPorArea[a] || {};
-            const nombresOrdenados = Object.keys(especialidadesDelArea).sort((x, y) =>
-              x.localeCompare(y, undefined, { numeric: true, sensitivity: "base" })
-            );
-            if (nombresOrdenados.length === 0) return null;
-            return (
-              <div key={a} style={{ marginBottom: 28 }}>
-                <div
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 700,
-                    color: "#eef7f5",
-                    textTransform: "uppercase",
-                    letterSpacing: 0.5,
-                    marginBottom: 12,
-                    padding: "8px 12px",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    background: "rgba(8,28,31,.65)",
-                    borderRadius: 8,
-                    borderBottom: `2px solid ${colorForArea(a)}`,
-                  }}
-                >
-                  <span
-                    style={{
-                      width: 10,
-                      height: 10,
-                      borderRadius: "50%",
-                      background: colorForArea(a),
-                      flexShrink: 0,
-                      boxShadow: `0 0 6px ${colorForArea(a)}`,
-                    }}
-                  />
-                  {a} <span style={{ color: "#8fa8a8", fontWeight: 400, textTransform: "none" }}>({nombresOrdenados.length} especialidades)</span>
-                </div>
-                <div
-                  style={{
-                    display: "grid",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                    gap: 16,
-                  }}
-                >
-                  {nombresOrdenados.map((esp, i) => {
-                    const s = especialidadesDelArea[esp];
-                    const pctEsp = s.archivosNecesarios > 0 ? Math.round((s.archivosCompletados / s.archivosNecesarios) * 100) : 0;
-                    return <EspecialidadMiniCard key={esp} nombre={esp} pct={pctEsp} total={s.total} delay={i * 30} />;
-                  })}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {!modoPresentacion && (
-      <div className="chijnaya-modo-transicion" style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 24 }}>
-        {/* Carpetas pendientes */}
-        <div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
-            <h2 style={{ fontSize: 16, color: "#dceeec", margin: 0 }}>
-              Carpetas — {ESTADO_FILTRO_LABEL[filtroEstado]}{areaLabel}
-            </h2>
-          </div>
-
-          {/* Buscador rápido por nombre/ruta de carpeta */}
-          <input
-            type="text"
-            value={busqueda}
-            onChange={(e) => setBusqueda(e.target.value)}
-            placeholder="🔍 Buscar carpeta por nombre..."
-            style={{
-              width: "100%",
-              boxSizing: "border-box",
-              background: "#0e2529",
-              color: "#eef7f5",
-              border: "1px solid #2b5c5c",
-              borderRadius: 8,
-              padding: "9px 12px",
-              fontSize: 13,
-              marginBottom: 12,
-              outline: "none",
-            }}
-          />
-
-          {/* Exportar reporte institucional — un PDF y un Excel por cada área */}
-          <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-            {areas.map((a) => (
-              <div key={a} style={{ display: "flex", gap: 4 }}>
-                <button
-                  onClick={() => handleExportarArea(a, carpetasPorArea[a] || [])}
-                  disabled={exportandoArea === a}
-                  style={{
-                    fontSize: 11,
-                    padding: "6px 12px",
-                    borderRadius: "20px 0 0 20px",
-                    border: "1px solid #2b5c5c",
-                    background: "#0e2529",
-                    color: exportandoArea === a ? "#8fa8a8" : "#dceeec",
-                    fontWeight: 600,
-                    cursor: exportandoArea === a ? "not-allowed" : "pointer",
-                  }}
-                  title={`Exportar reporte PDF de ${a}`}
-                >
-                  📄 {exportandoArea === a ? "Generando..." : `PDF ${a}`}
-                </button>
-                <button
-                  onClick={() => handleExportarExcelArea(a, carpetasPorArea[a] || [])}
-                  disabled={exportandoExcelArea === a}
-                  style={{
-                    fontSize: 11,
-                    padding: "6px 12px",
-                    borderRadius: 0,
-                    border: "1px solid #2b5c5c",
-                    borderLeft: "none",
-                    background: "#0e2529",
-                    color: exportandoExcelArea === a ? "#8fa8a8" : "#2dd4bf",
-                    fontWeight: 600,
-                    cursor: exportandoExcelArea === a ? "not-allowed" : "pointer",
-                  }}
-                  title={`Exportar reporte Excel (editable) de ${a}`}
-                >
-                  📊 {exportandoExcelArea === a ? "Generando..." : "Excel"}
-                </button>
-                <button
-                  onClick={() => handleExportarIndiceArea(a, carpetasPorArea[a] || [])}
-                  disabled={exportandoIndiceArea === a}
-                  style={{
-                    fontSize: 11,
-                    padding: "6px 12px",
-                    borderRadius: "0 20px 20px 0",
-                    border: "1px solid #2b5c5c",
-                    borderLeft: "none",
-                    background: "#0e2529",
-                    color: exportandoIndiceArea === a ? "#8fa8a8" : "#f0d264",
-                    fontWeight: 600,
-                    cursor: exportandoIndiceArea === a ? "not-allowed" : "pointer",
-                  }}
-                  title={`Exportar Lista General (N° Orden / N° Separador / Descripción / N° Archivadores) de ${a}`}
-                >
-                  📑 {exportandoIndiceArea === a ? "Generando..." : "Exportar Lista General"}
-                </button>
-              </div>
-            ))}
-          </div>
-
-          {/* Grilla de áreas — mini círculos de progreso, un click para filtrar */}
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
-              gap: 8,
-              marginBottom: 14,
+              overflow: "hidden",
+              boxShadow: "inset 0 2px 6px rgba(0,0,0,.5), 0 0 0 1px #1f4a4a",
             }}
           >
-            <AreaMiniCard
-              area="Todas"
-              pct={resumen?.pctArchivos ?? 0}
-              total={resumen?.totalFinales ?? 0}
-              color="#17a398"
-              active={filtroArea === "Todas"}
-              onClick={() => setFiltroArea("Todas")}
+            <div
+              className="chijnaya-barra-avance"
+              style={{
+                width: `${pct}%`,
+                height: "100%",
+                backgroundImage:
+                  "repeating-linear-gradient(45deg, rgba(255,255,255,.18) 0px, rgba(255,255,255,.18) 9px, transparent 9px, transparent 18px), linear-gradient(90deg,#17a398,#0e7c72)",
+                backgroundSize: "36px 36px, 100% 100%",
+                transition: "width .4s ease",
+                boxShadow: "0 0 22px rgba(14,124,114,.65)",
+                borderRadius: 17,
+              }}
             />
+          </div>
+        </div>
+
+        {/* Barra de archivos */}
+        <div
+          style={{
+            marginBottom: 32,
+            background: "rgba(8,28,31,.75)",
+            backdropFilter: "blur(6px)",
+            borderRadius: 12,
+            padding: "16px 18px",
+            border: "1px solid #1f4a4a",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+            <span style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", letterSpacing: 0.5 }}>
+              <span style={{ color: "#2dd4bf" }}>»» </span>AVANCE POR ARCHIVOS <span style={{ fontSize: 11, color: "#8fa8a8", fontWeight: 400 }}>(más preciso)</span>
+            </span>
+            <strong style={{ fontSize: 30, color: "#2dd4bf", textShadow: "0 0 18px rgba(45,212,191,.6)" }}>
+              {resumen?.pctArchivos ?? "–"}%
+            </strong>
+          </div>
+          <div style={{ fontSize: 11, color: "#8fa8a8", marginBottom: 8 }}>
+            {resumen?.totalArchivosCompletados ?? "–"} de {resumen?.totalArchivosNecesarios ?? "–"} archivos que hacen falta, ya están subidos
+          </div>
+          <div
+            style={{
+              height: 22,
+              background: "#0a1e20",
+              borderRadius: 11,
+              overflow: "hidden",
+              boxShadow: "inset 0 2px 6px rgba(0,0,0,.5), 0 0 0 1px #1f4a4a",
+            }}
+          >
+            <div
+              style={{
+                width: `${resumen?.pctArchivos ?? 0}%`,
+                height: "100%",
+                background: "linear-gradient(90deg,#2dd4bf,#0d9488)",
+                transition: "width .4s ease",
+                boxShadow: "0 0 16px rgba(45,212,191,.5)",
+                borderRadius: 11,
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Contadores con desglose */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 32 }}>
+          <Card label="Carpetas finales" value={resumen?.totalFinales ?? "–"} color="#17a398" grande={modoPresentacion} />
+          <Card label="Completas" value={resumen?.completas ?? "–"} color="#2ecc71" grande={modoPresentacion} />
+          <Card label="Incompletas" value={resumen?.incompletas ?? "–"} color="#f39c12" grande={modoPresentacion} />
+          <Card label="Vacías" value={resumen?.vacias ?? "–"} color="#e74c3c" grande={modoPresentacion} />
+        </div>
+
+        {/* Selector de Rango de Fechas para Actividad/Heatmap */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 10 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#dceeec" }}>
+            Visualización de Actividad e Historial
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[
+              { label: "30 días", val: 30 },
+              { label: "84 días", val: 84 },
+              { label: "119 días", val: 119 },
+            ].map((btn) => (
+              <button
+                key={btn.val}
+                onClick={() => setRangoDiasHeatmap(btn.val)}
+                style={{
+                  fontSize: 11,
+                  padding: "5px 12px",
+                  borderRadius: 16,
+                  border: `1px solid ${rangoDiasHeatmap === btn.val ? "#2dd4bf" : "#2b5c5c"}`,
+                  background: rangoDiasHeatmap === btn.val ? "#2dd4bf22" : "#0e2529",
+                  color: rangoDiasHeatmap === btn.val ? "#2dd4bf" : "#b7c9c6",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                {btn.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Sección de Tendencia de avance y Actividad */}
+        {historial.length >= 2 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 16, marginBottom: 32 }}>
+            <TendenciaChart historial={historial} grande={modoPresentacion} actividadPorDia={actividadPorDia} />
+            <ActividadHeatmap actividadPorDia={actividadPorDia} diasCustom={rangoDiasHeatmap} grande={modoPresentacion} onMarcarCompleta={handleMarcarCompleta} marcandoId={marcandoId} />
+          </div>
+        ) : (
+          <div style={{ marginBottom: 32 }}>
+            <ActividadHeatmap actividadPorDia={actividadPorDia} diasCustom={rangoDiasHeatmap} grande={modoPresentacion} onMarcarCompleta={handleMarcarCompleta} marcandoId={marcandoId} />
+          </div>
+        )}
+
+        {modoPresentacion && (
+          <div
+            className="chijnaya-fade-in chijnaya-modo-transicion"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+              gap: 28,
+              justifyItems: "center",
+              marginTop: 8,
+            }}
+          >
             {areas.map((a) => {
-              const s = areaStats[a];
-              if (!s) return null;
-              const areaPct =
-                s.archivosNecesarios > 0 ? Math.round((s.archivosCompletados / s.archivosNecesarios) * 100) : 0;
+              const stats = areaStats[a] || { total: 0, completas: 0, incompletas: 0, vacias: 0, archivosNecesarios: 0, archivosCompletados: 0 };
+              const pctArea =
+                stats.archivosNecesarios > 0
+                  ? Math.round((stats.archivosCompletados / stats.archivosNecesarios) * 100)
+                  : 0;
               return (
                 <AreaMiniCard
                   key={a}
                   area={a}
-                  pct={areaPct}
-                  total={s.total}
+                  pct={pctArea}
+                  total={stats.total}
+                  incompletas={stats.incompletas}
+                  vacias={stats.vacias}
                   color={colorForArea(a)}
-                  active={filtroArea === a}
-                  onClick={() => setFiltroArea(filtroArea === a ? "Todas" : a)}
+                  active={false}
+                  onClick={() => {}}
+                  tamano={280}
                 />
               );
             })}
           </div>
+        )}
 
-          {/* Panel de progreso circular — detalle ampliado de la especialidad elegida */}
-          {filtroArea !== "Todas" && areaStats[filtroArea] && (
-            <AreaProgressPanel area={filtroArea} stats={areaStats[filtroArea]} color={colorForArea(filtroArea)} />
-          )}
-
-          {/* Filtro por estado — botones de un click, sin desplegable */}
-          <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
-            {ESTADO_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                onClick={() => setFiltroEstado(opt.value)}
-                style={chipStyle(filtroEstado === opt.value, opt.color)}
-              >
-                {opt.label}
-              </button>
-            ))}
-            <button
-              onClick={() => setColapsados((prev) => ({ ...prev, __all: !prev.__all }))}
-              style={{ ...chipStyle(false, "#b7c9c6"), fontWeight: 700 }}
-            >
-              {colapsados.__all ? "▸ Expandir todo" : "▾ Colapsar todo"}
-            </button>
-          </div>
-
-          <div
-            key={`${filtroEstado}-${filtroArea}-${busqueda}`}
-            className="chijnaya-fade-in"
-            style={{
-              background: "rgba(21,27,43,.5)",
-              backdropFilter: "blur(6px)",
-              borderRadius: 12,
-              overflow: "hidden",
-              border: "1px solid #1f4a4a",
-            }}
-          >
-            {visibles.length === 0 && (
-              <div
-                className="chijnaya-fade-in"
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  textAlign: "center",
-                  padding: "48px 24px",
-                  gap: 8,
-                }}
-              >
-                <div style={{ fontSize: 34, opacity: 0.7 }}>
-                  {carpetas.length === 0 ? "⏳" : "🔍"}
-                </div>
-                <div style={{ fontSize: 15, fontWeight: 700, color: "#dceeec" }}>
-                  {carpetas.length === 0
-                    ? "Sin datos todavía"
-                    : "No hay carpetas que coincidan"}
-                </div>
-                <div style={{ fontSize: 12.5, color: "#8fa8a8", maxWidth: 340 }}>
-                  {carpetas.length === 0
-                    ? "Esperando la primera sincronización con Google Drive."
-                    : "Prueba otro término de búsqueda, o cambia el filtro de estado/área arriba."}
-                </div>
-              </div>
-            )}
-            {(() => {
-              // Agrupar por "especialidad": segundo nivel de la ruta, dentro de cada area.
-              // Ej: "PROYECTO PRINCIPAL / 11. ESTUDIOS BASICOS / 11.1_..." se agrupa bajo
-              // el encabezado "PROYECTO PRINCIPAL › 11. ESTUDIOS BASICOS"
-              const grupos = {};
-              const ordenGrupos = [];
-              for (const c of visibles) {
-                const partes = (c.ruta || c.nombre || "").split(" / ").filter(Boolean);
-                const especialidad = partes.length > 1 ? partes[1] : "(raíz)";
-                const key = `${c.area || "Sin área"} / ${especialidad}`;
-                if (!grupos[key]) {
-                  grupos[key] = { area: c.area || "Sin área", especialidad, items: [] };
-                  ordenGrupos.push(key);
-                }
-                grupos[key].items.push(c);
-              }
-              ordenGrupos.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
-
-              return ordenGrupos.map((key) => {
-                const g = grupos[key];
-                const HEADER_COLOR = "#0a6058"; // verde con buen contraste sobre blanco
-                const color = HEADER_COLOR;
-                const pendientesGrupo = g.items.filter((c) => c.estado !== "completa").length;
-                const vaciasGrupo = g.items.filter((c) => c.estado === "vacia").length;
-                const tienePendientes = pendientesGrupo > 0;
-                const grupoColapsado = colapsados.__all ? !colapsados[key] : !!colapsados[key];
-                return (
-                  <div key={key}>
-                    <div
-                      onClick={() => toggleGrupo(key)}
+        {modoPresentacion && areas.length > 0 && (
+          <div className="chijnaya-fade-in chijnaya-modo-transicion" style={{ marginTop: 36 }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#dceeec", marginBottom: 20, display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ color: "#2dd4bf" }}>»» </span>AVANCE POR ESPECIALIDAD, POR ÁREA
+            </div>
+            {areas.map((a) => {
+              const especialidadesDelArea = especialidadPorArea[a] || {};
+              const nombresOrdenados = Object.keys(especialidadesDelArea).sort((x, y) =>
+                x.localeCompare(y, undefined, { numeric: true, sensitivity: "base" })
+              );
+              if (nombresOrdenados.length === 0) return null;
+              return (
+                <div key={a} style={{ marginBottom: 28 }}>
+                  <div
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: "#eef7f5",
+                      textTransform: "uppercase",
+                      letterSpacing: 0.5,
+                      marginBottom: 12,
+                      padding: "8px 12px",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      background: "rgba(8,28,31,.65)",
+                      borderRadius: 8,
+                      borderBottom: `2px solid ${colorForArea(a)}`,
+                    }}
+                  >
+                    <span
                       style={{
-                        padding: "10px 16px 10px 14px",
-                        background: "#e3f2f0",
-                        borderLeft: `4px solid ${vaciasGrupo > 0 ? "#e74c3c" : tienePendientes ? "#f39c12" : "#2ecc71"}`,
-                        borderTop: "1px solid #1f4a4a",
-                        borderBottom: "1px solid #bcdcd8",
-                        display: "flex",
-                        alignItems: "baseline",
-                        gap: 8,
-                        cursor: "pointer",
-                        userSelect: "none",
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        background: colorForArea(a),
+                        flexShrink: 0,
+                        boxShadow: `0 0 6px ${colorForArea(a)}`,
                       }}
-                      title={grupoColapsado ? "Click para expandir" : "Click para colapsar"}
-                    >
-                      <span style={{ fontSize: 12, color: "#2f625e", transform: grupoColapsado ? "rotate(-90deg)" : "none", display: "inline-block", transition: "transform .15s ease" }}>
-                        ▾
-                      </span>
-                      <span style={{ fontSize: 11, fontWeight: 800, color, textTransform: "uppercase", letterSpacing: 0.4 }}>
-                        {g.area}
-                      </span>
-                      <span style={{ color: "#5ba39d", fontSize: 12 }}>›</span>
-                      <span style={{ fontSize: 14, fontWeight: 800, color: "#0d3b3b" }}>{g.especialidad}</span>
-                      <span style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
-                        <MiniDona completas={g.items.length - pendientesGrupo} total={g.items.length} />
-                        {tienePendientes && (
-                          <span
-                            style={{
-                              fontSize: 10,
-                              padding: "2px 8px",
-                              borderRadius: 20,
-                              background: (vaciasGrupo > 0 ? "#e74c3c" : "#f39c12") + "22",
-                              color: vaciasGrupo > 0 ? "#c0392b" : "#0d6b62",
-                              fontWeight: 700,
-                            }}
-                          >
-                            {pendientesGrupo} pendiente{pendientesGrupo !== 1 ? "s" : ""}
-                          </span>
-                        )}
-                        <span style={{ fontSize: 10, color: "#2f625e", fontWeight: 600 }}>
-                          {g.items.length} carpeta{g.items.length !== 1 ? "s" : ""}
-                        </span>
-                      </span>
-                    </div>
-                    {!grupoColapsado && g.items.map((c) => {
-                      const detalle = c.detalle || c.estado;
-                      const driveUrl = `https://drive.google.com/drive/folders/${c.id}`;
+                    />
+                    {a} <span style={{ color: "#8fa8a8", fontWeight: 400, textTransform: "none" }}>({nombresOrdenados.length} especialidades)</span>
+                  </div>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+                      gap: 18,
+                    }}
+                  >
+                    {nombresOrdenados.map((esp, i) => {
+                      const s = especialidadesDelArea[esp];
+                      const pctEsp = s.archivosNecesarios > 0 ? Math.round((s.archivosCompletados / s.archivosNecesarios) * 100) : 0;
                       return (
-                        <div
-                          key={c.id}
-                          onClick={() => window.open(driveUrl, "_blank", "noopener,noreferrer")}
-                          style={{
-                            padding: "10px 16px 10px 24px",
-                            borderBottom: "1px solid #1f4a4a",
-                            cursor: "pointer",
-                          }}
-                          onMouseEnter={(e) => (e.currentTarget.style.background = "#173838")}
-                          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-                          title="Abrir esta carpeta en Google Drive"
-                        >
-                          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                            <RutaJerarquica ruta={c.ruta} nombre={c.nombre} skipLevels={2} />
+                        <EspecialidadMiniCard
+                          key={esp}
+                          nombre={esp}
+                          pct={pctEsp}
+                          total={s.total}
+                          incompletas={s.incompletas}
+                          vacias={s.vacias}
+                          delay={i * 30}
+                        />
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {!modoPresentacion && (
+        <div className="chijnaya-modo-transicion" style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 24 }}>
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+              <h2 style={{ fontSize: 16, color: "#dceeec", margin: 0 }}>
+                Carpetas — {ESTADO_FILTRO_LABEL[filtroEstado]}{areaLabel}
+              </h2>
+            </div>
+
+            <input
+              type="text"
+              value={busqueda}
+              onChange={(e) => setBusqueda(e.target.value)}
+              placeholder="🔍 Buscar carpeta por nombre..."
+              style={{
+                width: "100%",
+                boxSizing: "border-box",
+                background: "#0e2529",
+                color: "#eef7f5",
+                border: "1px solid #2b5c5c",
+                borderRadius: 8,
+                padding: "9px 12px",
+                fontSize: 13,
+                marginBottom: 12,
+                outline: "none",
+              }}
+            />
+
+            <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+              {areas.map((a) => (
+                <div key={a} style={{ display: "flex", gap: 4 }}>
+                  <button
+                    onClick={() => handleExportarArea(a, carpetasPorArea[a] || [])}
+                    disabled={exportandoArea === a}
+                    style={{
+                      fontSize: 11,
+                      padding: "6px 12px",
+                      borderRadius: "20px 0 0 20px",
+                      border: "1px solid #2b5c5c",
+                      background: "#0e2529",
+                      color: exportandoArea === a ? "#8fa8a8" : "#dceeec",
+                      fontWeight: 600,
+                      cursor: exportandoArea === a ? "not-allowed" : "pointer",
+                    }}
+                    title={`Exportar reporte PDF de ${a}`}
+                  >
+                    📄 {exportandoArea === a ? "Generando..." : `PDF ${a}`}
+                  </button>
+                  <button
+                    onClick={() => handleExportarExcelArea(a, carpetasPorArea[a] || [])}
+                    disabled={exportandoExcelArea === a}
+                    style={{
+                      fontSize: 11,
+                      padding: "6px 12px",
+                      borderRadius: "0",
+                      border: "1px solid #2b5c5c",
+                      borderLeft: "none",
+                      background: "#0e2529",
+                      color: exportandoExcelArea === a ? "#8fa8a8" : "#2dd4bf",
+                      fontWeight: 600,
+                      cursor: exportandoExcelArea === a ? "not-allowed" : "pointer",
+                    }}
+                    title={`Exportar reporte Excel de ${a}`}
+                  >
+                    📊 {exportandoExcelArea === a ? "Generando..." : "Excel"}
+                  </button>
+                  <button
+                    onClick={() => handleExportarSeparadores(a, carpetasPorArea[a] || [])}
+                    disabled={exportandoSeparadores === a}
+                    style={{
+                      fontSize: 11,
+                      padding: "6px 12px",
+                      borderRadius: "0 20px 20px 0",
+                      border: "1px solid #2b5c5c",
+                      borderLeft: "none",
+                      background: "#0e2529",
+                      color: exportandoSeparadores === a ? "#8fa8a8" : "#f0b27a",
+                      fontWeight: 600,
+                      cursor: exportandoSeparadores === a ? "not-allowed" : "pointer",
+                    }}
+                    title={`Exportar lista para separadores de ${a}`}
+                  >
+                    📑 {exportandoSeparadores === a ? "Generando..." : "Lista para separadores"}
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
+                gap: 8,
+                marginBottom: 14,
+              }}
+            >
+              <AreaMiniCard
+                area="Todas"
+                pct={resumen?.pctArchivos ?? 0}
+                total={resumen?.totalFinales ?? 0}
+                color="#17a398"
+                active={filtroArea === "Todas"}
+                onClick={() => setFiltroArea("Todas")}
+              />
+              {areas.map((a) => {
+                const s = areaStats[a];
+                if (!s) return null;
+                const areaPct =
+                  s.archivosNecesarios > 0 ? Math.round((s.archivosCompletados / s.archivosNecesarios) * 100) : 0;
+                return (
+                  <AreaMiniCard
+                    key={a}
+                    area={a}
+                    pct={areaPct}
+                    total={s.total}
+                    color={colorForArea(a)}
+                    active={filtroArea === a}
+                    onClick={() => setFiltroArea(filtroArea === a ? "Todas" : a)}
+                  />
+                );
+              })}
+            </div>
+
+            {filtroArea !== "Todas" && areaStats[filtroArea] && (
+              <AreaProgressPanel area={filtroArea} stats={areaStats[filtroArea]} color={colorForArea(filtroArea)} />
+            )}
+
+            <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
+              {ESTADO_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => setFiltroEstado(opt.value)}
+                  style={chipStyle(filtroEstado === opt.value, opt.color)}
+                >
+                  {opt.label}
+                </button>
+              ))}
+              <button
+                onClick={() => setColapsados((prev) => ({ ...prev, __all: !prev.__all }))}
+                style={{ ...chipStyle(false, "#b7c9c6"), fontWeight: 700 }}
+              >
+                {colapsados.__all ? "▸ Expandir todo" : "▾ Colapsar todo"}
+              </button>
+            </div>
+
+            <div
+              key={`${filtroEstado}-${filtroArea}-${busqueda}`}
+              className="chijnaya-fade-in"
+              style={{
+                background: "rgba(21,27,43,.5)",
+                backdropFilter: "blur(6px)",
+                borderRadius: 12,
+                overflow: "hidden",
+                border: "1px solid #1f4a4a",
+              }}
+            >
+              {visibles.length === 0 && (
+                <div
+                  className="chijnaya-fade-in"
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    textAlign: "center",
+                    padding: "48px 24px",
+                    gap: 8,
+                  }}
+                >
+                  <div style={{ fontSize: 34, opacity: 0.7 }}>
+                    {carpetas.length === 0 ? "⏳" : "🔍"}
+                  </div>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: "#dceeec" }}>
+                    {carpetas.length === 0 ? "Sin datos todavía" : "No hay carpetas que coincidan"}
+                  </div>
+                </div>
+              )}
+              {(() => {
+                const grupos = {};
+                const ordenGrupos = [];
+                for (const c of visibles) {
+                  const partes = (c.ruta || c.nombre || "").split(" / ").filter(Boolean);
+                  const especialidad = partes.length > 1 ? partes[1] : "(raíz)";
+                  const key = `${c.area || "Sin área"} / ${especialidad}`;
+                  if (!grupos[key]) {
+                    grupos[key] = { area: c.area || "Sin área", especialidad, items: [] };
+                    ordenGrupos.push(key);
+                  }
+                  grupos[key].items.push(c);
+                }
+                ordenGrupos.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }));
+
+                return ordenGrupos.map((key) => {
+                  const g = grupos[key];
+                  const color = "#0a6058";
+                  const pendientesGrupo = g.items.filter((c) => c.estado !== "completa").length;
+                  const vaciasGrupo = g.items.filter((c) => c.estado === "vacia").length;
+                  const tienePendientes = pendientesGrupo > 0;
+                  const grupoColapsado = colapsados.__all ? !colapsados[key] : !!colapsados[key];
+                  return (
+                    <div key={key}>
+                      <div
+                        onClick={() => toggleGrupo(key)}
+                        style={{
+                          padding: "10px 16px 10px 14px",
+                          background: "#e3f2f0",
+                          borderLeft: `4px solid ${vaciasGrupo > 0 ? "#e74c3c" : tienePendientes ? "#f39c12" : "#2ecc71"}`,
+                          borderTop: "1px solid #1f4a4a",
+                          borderBottom: "1px solid #bcdcd8",
+                          display: "flex",
+                          alignItems: "baseline",
+                          gap: 8,
+                          cursor: "pointer",
+                          userSelect: "none",
+                        }}
+                      >
+                        <span style={{ fontSize: 12, color: "#2f625e", transform: grupoColapsado ? "rotate(-90deg)" : "none", display: "inline-block", transition: "transform .15s ease" }}>
+                          ▾
+                        </span>
+                        <span style={{ fontSize: 11, fontWeight: 800, color, textTransform: "uppercase", letterSpacing: 0.4 }}>
+                          {g.area}
+                        </span>
+                        <span style={{ color: "#5ba39d", fontSize: 12 }}>›</span>
+                        <span style={{ fontSize: 14, fontWeight: 800, color: "#0d3b3b" }}>{g.especialidad}</span>
+                        <span style={{ display: "flex", alignItems: "center", gap: 8, marginLeft: "auto" }}>
+                          <MiniDona completas={g.items.length - pendientesGrupo} total={g.items.length} />
+                          {tienePendientes && (
                             <span
                               style={{
                                 fontSize: 10,
                                 padding: "2px 8px",
                                 borderRadius: 20,
-                                background: ESTADO_COLOR[c.estado] + "22",
-                                color: ESTADO_COLOR[c.estado],
-                                textTransform: "uppercase",
-                                fontWeight: 600,
-                                whiteSpace: "nowrap",
-                                flexShrink: 0,
+                                background: (vaciasGrupo > 0 ? "#e74c3c" : "#f39c12") + "22",
+                                color: vaciasGrupo > 0 ? "#c0392b" : "#0d6b62",
+                                fontWeight: 700,
                               }}
                             >
-                              {c.estado}{c.forzada ? " · manual" : ""}
+                              {pendientesGrupo} pendiente{pendientesGrupo !== 1 ? "s" : ""}
                             </span>
-                          </div>
-                          {c.forzada && (
-                            <div
-                              style={{
-                                marginTop: 6,
-                                padding: "6px 10px",
-                                background: "#2dd4bf14",
-                                border: "1px solid #2dd4bf33",
-                                borderRadius: 8,
-                                fontSize: 11,
-                                color: "#9db3b0",
-                              }}
-                            >
-                              ✓ Marcada por <strong style={{ color: "#2dd4bf" }}>{c.marcadoPor || "alguien"}</strong>
-                              {c.marcadoEn && ` — ${tiempoRelativo(new Date(c.marcadoEn))}`}
-                              {c.motivo && (
-                                <>
-                                  <br />
-                                  <span style={{ fontStyle: "italic" }}>"{c.motivo}"</span>
-                                </>
-                              )}
-                            </div>
                           )}
-                          <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 6 }}>
-                            <span style={{ fontSize: 11, color: "#b7c9c6" }}>{detalle}</span>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleMarcarCompleta(c.id, !c.forzada, c.nombre, c.ruta);
-                              }}
-                              disabled={marcandoId === c.id}
-                              style={{
-                                fontSize: 10,
-                                padding: "3px 9px",
-                                borderRadius: 20,
-                                border: c.forzada ? "1px solid #e74c3c66" : "1px solid #2ecc7166",
-                                background: "transparent",
-                                color: marcandoId === c.id ? "#5c7a78" : c.forzada ? "#e88f86" : "#7fe0a3",
-                                cursor: marcandoId === c.id ? "not-allowed" : "pointer",
-                                whiteSpace: "nowrap",
-                                flexShrink: 0,
-                              }}
-                              title={
-                                c.forzada
-                                  ? "Quitar la marca manual (vuelve a depender de los archivos)"
-                                  : "Marcar como completa manualmente (excepción, ej. documento escaneado sin editable)"
-                              }
-                            >
-                              {marcandoId === c.id ? "..." : c.forzada ? "✕ Desmarcar" : "✓ Marcar completa"}
-                            </button>
+                          <span style={{ fontSize: 10, color: "#2f625e", fontWeight: 600 }}>
+                            {g.items.length} carpeta{g.items.length !== 1 ? "s" : ""}
+                          </span>
+                        </span>
+                      </div>
+                      {!grupoColapsado && g.items.map((c) => {
+                        const detalle = c.detalle || c.estado;
+                        const driveUrl = `https://drive.google.com/drive/folders/${c.id}`;
+                        return (
+                          <div
+                            key={c.id}
+                            onClick={() => window.open(driveUrl, "_blank", "noopener,noreferrer")}
+                            style={{
+                              padding: "10px 16px 10px 24px",
+                              borderBottom: "1px solid #1f4a4a",
+                              cursor: "pointer",
+                            }}
+                            onMouseEnter={(e) => (e.currentTarget.style.background = "#173838")}
+                            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                          >
+                            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                              <RutaJerarquica ruta={c.ruta} nombre={c.nombre} skipLevels={2} />
+                              <span
+                                style={{
+                                  fontSize: 10,
+                                  padding: "2px 8px",
+                                  borderRadius: 20,
+                                  background: ESTADO_COLOR[c.estado] + "22",
+                                  color: ESTADO_COLOR[c.estado],
+                                  textTransform: "uppercase",
+                                  fontWeight: 600,
+                                  whiteSpace: "nowrap",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {c.estado}{c.forzada ? " · manual" : ""}
+                              </span>
+                            </div>
+                            {c.forzada && (
+                              <div
+                                style={{
+                                  marginTop: 6,
+                                  padding: "6px 10px",
+                                  background: "#2dd4bf14",
+                                  border: "1px solid #2dd4bf33",
+                                  borderRadius: 8,
+                                  fontSize: 11,
+                                  color: "#9db3b0",
+                                }}
+                              >
+                                ✓ Marcada por <strong style={{ color: "#2dd4bf" }}>{c.marcadoPor || "alguien"}</strong>
+                              </div>
+                            )}
+                            <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, marginTop: 6 }}>
+                              <span style={{ fontSize: 11, color: "#b7c9c6" }}>{detalle}</span>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleMarcarCompleta(c.id, !c.forzada, c.nombre, c.ruta);
+                                }}
+                                disabled={marcandoId === c.id}
+                                style={{
+                                  fontSize: 10,
+                                  padding: "3px 9px",
+                                  borderRadius: 20,
+                                  border: c.forzada ? "1px solid #e74c3c66" : "1px solid #2ecc7166",
+                                  background: "transparent",
+                                  color: marcandoId === c.id ? "#5c7a78" : c.forzada ? "#e88f86" : "#7fe0a3",
+                                  cursor: marcandoId === c.id ? "not-allowed" : "pointer",
+                                  whiteSpace: "nowrap",
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {marcandoId === c.id ? "..." : c.forzada ? "✕ Desmarcar" : "✓ Marcar completa"}
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                );
-              });
-            })()}
-          </div>
-        </div>
-
-        {/* Log de actividad */}
-        <div>
-          <h2 style={{ fontSize: 16, color: "#dceeec", marginBottom: 8 }}>Actividad reciente</h2>
-
-          {/* Resumen de conteo por tipo, de los ultimos eventos cargados */}
-          {eventos.length > 0 && (
-            <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
-              {Object.entries(
-                eventos.reduce((acc, e) => {
-                  acc[e.tipo] = (acc[e.tipo] || 0) + 1;
-                  return acc;
-                }, {})
-              ).map(([tipo, count]) => (
-                <span
-                  key={tipo}
-                  style={{
-                    fontSize: 10,
-                    padding: "3px 9px",
-                    borderRadius: 20,
-                    background: (EVENTO_COLOR[tipo] || "#9db3b0") + "22",
-                    color: EVENTO_COLOR[tipo] || "#9db3b0",
-                    fontWeight: 700,
-                  }}
-                >
-                  {EVENTO_ICONO[tipo] || "•"} {count} {EVENTO_LABEL[tipo] || tipo}
-                </span>
-              ))}
+                        );
+                      })}
+                    </div>
+                  );
+                });
+              })()}
             </div>
-          )}
+          </div>
 
-          <div
-            style={{
-              background: "rgba(21,27,43,.5)",
-              backdropFilter: "blur(6px)",
-              borderRadius: 12,
-              maxHeight: 480,
-              overflowY: "auto",
-              border: "1px solid #1f4a4a",
-            }}
-          >
-            {eventos.length === 0 && (
-              <p style={{ padding: 16, color: "#b7c9c6" }}>Sin eventos todavía.</p>
-            )}
-            {eventos.map((e) => {
-              const color = EVENTO_COLOR[e.tipo] || "#9db3b0";
-              const icono = EVENTO_ICONO[e.tipo] || "•";
-              const fecha = e.timestamp?.toDate ? e.timestamp.toDate() : null;
-              return (
-                <div
-                  key={e.id}
-                  style={{
-                    display: "flex",
-                    gap: 10,
-                    padding: "10px 14px",
-                    borderBottom: "1px solid #1f4a4a",
-                  }}
-                >
-                  {e.thumbnailLink && (
-                    <img
-                      src={e.thumbnailLink}
-                      alt=""
-                      style={{
-                        flexShrink: 0,
-                        width: 34,
-                        height: 34,
-                        objectFit: "cover",
-                        borderRadius: 6,
-                        border: "1px solid #2b5c5c",
-                        marginTop: 1,
-                      }}
-                      onError={(ev) => {
-                        ev.currentTarget.style.display = "none";
-                      }}
-                    />
-                  )}
+          <div>
+            <h2 style={{ fontSize: 16, color: "#dceeec", marginBottom: 8 }}>Actividad reciente</h2>
+            <div
+              style={{
+                background: "rgba(21,27,43,.5)",
+                backdropFilter: "blur(6px)",
+                borderRadius: 12,
+                maxHeight: 480,
+                overflowY: "auto",
+                border: "1px solid #1f4a4a",
+              }}
+            >
+              {eventos.length === 0 && (
+                <p style={{ padding: 16, color: "#b7c9c6" }}>Sin eventos todavía.</p>
+              )}
+              {eventos.map((e) => {
+                const color = EVENTO_COLOR[e.tipo] || "#9db3b0";
+                const icono = EVENTO_ICONO[e.tipo] || "•";
+                const fecha = e.timestamp?.toDate ? e.timestamp.toDate() : null;
+                return (
                   <div
+                    key={e.id}
                     style={{
-                      flexShrink: 0,
-                      width: 26,
-                      height: 26,
-                      borderRadius: "50%",
-                      background: color + "22",
-                      border: `1.5px solid ${color}`,
-                      color: color,
                       display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 13,
-                      fontWeight: 700,
-                      marginTop: 1,
+                      gap: 10,
+                      padding: "10px 14px",
+                      borderBottom: "1px solid #1f4a4a",
                     }}
                   >
-                    {icono}
-                  </div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13 }}>
-                      <strong>{e.usuario}</strong>{" "}
-                      <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span>{" "}
-                      <strong>{e.item}</strong>
+                    <div
+                      style={{
+                        flexShrink: 0,
+                        width: 26,
+                        height: 26,
+                        borderRadius: "50%",
+                        background: color + "22",
+                        border: `1.5px solid ${color}`,
+                        color: color,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        fontSize: 13,
+                        fontWeight: 700,
+                        marginTop: 1,
+                      }}
+                    >
+                      {icono}
                     </div>
-                    {e.motivo && (
-                      <div style={{ fontSize: 11.5, color: "#9db3b0", marginTop: 2, fontStyle: "italic" }}>
-                        "{e.motivo}"
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13 }}>
+                        <strong>{e.usuario}</strong> <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span> <strong>{e.item}</strong>
                       </div>
-                    )}
-                    <div style={{ fontSize: 11, color: "#9db3b0", marginTop: 2 }}>{e.ruta}</div>
-                    <div style={{ fontSize: 10, color: "#8fa8a8", marginTop: 2 }} title={fecha ? fecha.toLocaleString("es-PE") : ""}>
-                      {tiempoRelativo(fecha)}
+                      <div style={{ fontSize: 10, color: "#8fa8a8", marginTop: 2 }}>
+                        {tiempoRelativo(fecha)}
+                      </div>
                     </div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
         </div>
-      </div>
-      )}
+        )}
 
-      <div
-        style={{
-          marginTop: 40,
-          padding: "14px 18px",
-          background: "rgba(8,28,31,.75)",
-          backdropFilter: "blur(6px)",
-          border: "1px solid #1f4a4a",
-          borderRadius: 12,
-          textAlign: "center",
-          fontSize: 11,
-          color: "#8fa8a8",
-          lineHeight: 1.6,
-        }}
-      >
-        Gobierno Regional de Puno — Gerencia Regional de Infraestructura · Sub Gerencia de Estudios Definitivos
-        <br />
-        Expediente Técnico "C.S. Chijnaya"
-        {resumen?.ultimaSync?.toDate && ` · Última sincronización: ${tiempoRelativo(resumen.ultimaSync.toDate())}`}
-      </div>
       </div>
 
       {mostrarMarcadas && (
@@ -1439,21 +1378,11 @@ export default function Dashboard() {
                           background: "transparent",
                           color: marcandoId === c.id ? "#5c7a78" : "#e88f86",
                           cursor: marcandoId === c.id ? "not-allowed" : "pointer",
-                          whiteSpace: "nowrap",
                         }}
                       >
                         {marcandoId === c.id ? "..." : "✕ Desmarcar"}
                       </button>
                     </div>
-                    <div style={{ fontSize: 14.5, color: "#dceeec", marginTop: 10 }}>
-                      ✓ Marcada por <strong style={{ color: "#2dd4bf" }}>{c.marcadoPor || "alguien"}</strong>
-                      {c.marcadoEn && ` — ${tiempoRelativo(new Date(c.marcadoEn))}`}
-                    </div>
-                    {c.motivo && (
-                      <div style={{ fontSize: 14, color: "#b7c9c6", marginTop: 6, fontStyle: "italic" }}>
-                        "{c.motivo}"
-                      </div>
-                    )}
                   </div>
                 ))
               )}
@@ -1465,18 +1394,12 @@ export default function Dashboard() {
   );
 }
 
-// Muestra la ruta como breadcrumb jerarquico: niveles padre chicos/grises,
-// nombre final de la carpeta grande y resaltado. Si hay mas de 4 niveles,
-// colapsa los del medio con "…" para que siga siendo legible.
 function RutaJerarquica({ ruta, nombre, skipLevels = 0 }) {
   let partes = (ruta || nombre || "").split(" / ").filter(Boolean);
   if (skipLevels > 0 && partes.length > skipLevels) {
     partes = partes.slice(skipLevels);
   }
   let mostrar = partes;
-  if (partes.length > 4) {
-    mostrar = [partes[0], "…", partes[partes.length - 2], partes[partes.length - 1]];
-  }
 
   return (
     <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 4, flex: 1, minWidth: 0 }}>
@@ -1502,12 +1425,9 @@ function RutaJerarquica({ ruta, nombre, skipLevels = 0 }) {
   );
 }
 
-// Círculo chico para el avance por especialidad — deliberadamente más discreto
-// que AreaMiniCard (más chico, sin borde grueso ni glow) para no competir
-// visualmente con los círculos de área ya existentes.
-function EspecialidadMiniCard({ nombre, pct, total, delay }) {
-  const size = 90;
-  const stroke = 7;
+function EspecialidadMiniCard({ nombre, pct, total, incompletas = 0, vacias = 0, delay }) {
+  const size = 110;
+  const stroke = 8;
   const radius = (size - stroke) / 2;
   const circumference = 2 * Math.PI * radius;
   const offset = circumference - (pct / 100) * circumference;
@@ -1521,13 +1441,12 @@ function EspecialidadMiniCard({ nombre, pct, total, delay }) {
         flexDirection: "column",
         alignItems: "center",
         gap: 8,
-        padding: "12px 8px",
-        borderRadius: 10,
+        padding: "18px 12px",
+        borderRadius: 12,
         background: "#0e252966",
         border: "1px solid #1f4a4a",
         animationDelay: `${delay}ms`,
       }}
-      title={`${nombre} — ${pct}% (${total} carpetas)`}
     >
       <svg width={size} height={size}>
         <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#1f4a4a" strokeWidth={stroke} />
@@ -1542,21 +1461,24 @@ function EspecialidadMiniCard({ nombre, pct, total, delay }) {
           strokeDasharray={circumference}
           strokeDashoffset={offset}
           transform={`rotate(-90 ${size / 2} ${size / 2})`}
-          style={{ transition: "stroke-dashoffset .5s ease" }}
         />
-        <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central" fontSize="16" fontWeight="700" fill="#eef7f5">
+        <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central" fontSize="20" fontWeight="800" fill="#eef7f5">
           {pct}%
         </text>
       </svg>
-      <div style={{ fontSize: 11, fontWeight: 600, color: "#b7c9c6", textAlign: "center", lineHeight: 1.25, maxWidth: 130 }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: "#eef7f5", textAlign: "center", lineHeight: 1.3, maxWidth: 150 }}>
         {nombre}
       </div>
-      <div style={{ fontSize: 10, color: "#8fa8a8" }}>{total} carpetas</div>
+      <div style={{ fontSize: 12, color: "#9db3b0", fontWeight: 700 }}>{total} carpetas</div>
+      <div style={{ fontSize: 13, textAlign: "center", display: "flex", gap: 10, marginTop: 4 }}>
+        <span style={{ color: "#f39c12", fontWeight: 700 }}>{incompletas} inc.</span>
+        <span style={{ color: "#e74c3c", fontWeight: 700 }}>{vacias} vacías</span>
+      </div>
     </div>
   );
 }
 
-function AreaMiniCard({ area, pct, total, color, active, onClick, tamano }) {
+function AreaMiniCard({ area, pct, total, incompletas = 0, vacias = 0, color, active, onClick, tamano }) {
   const size = tamano || 128;
   const stroke = Math.max(9, Math.round(size * 0.06));
   const radius = (size - stroke) / 2;
@@ -1573,15 +1495,15 @@ function AreaMiniCard({ area, pct, total, color, active, onClick, tamano }) {
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        gap: Math.round(size * 0.07),
-        padding: "18px 10px",
+        gap: Math.round(size * 0.05),
+        padding: "18px 14px",
         borderRadius: 14,
         border: `2px solid ${active ? color : "#1f4a4a"}`,
         background: active ? color + "18" : "#0e2529",
         cursor: "pointer",
         transition: "all .15s ease",
+        width: tamano ? "100%" : "auto",
       }}
-      title={`${area} — ${pct}% completo (${total} carpetas)`}
     >
       <svg width={size} height={size}>
         <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#1f4a4a" strokeWidth={stroke} />
@@ -1596,155 +1518,39 @@ function AreaMiniCard({ area, pct, total, color, active, onClick, tamano }) {
           strokeDasharray={circumference}
           strokeDashoffset={offset}
           transform={`rotate(-90 ${size / 2} ${size / 2})`}
-          style={{ transition: "stroke-dashoffset .5s ease" }}
         />
-        {/* Arco chiquito que gira sin parar, para dar sensación de "actualizando en vivo" */}
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={radius}
-          fill="none"
-          stroke="#eef7f5"
-          strokeWidth={Math.max(2, stroke * 0.28)}
-          strokeLinecap="round"
-          strokeDasharray={`${circumference * 0.09} ${circumference * 0.91}`}
-          opacity="0.75"
-        >
-          <animateTransform
-            attributeName="transform"
-            type="rotate"
-            from={`0 ${size / 2} ${size / 2}`}
-            to={`360 ${size / 2} ${size / 2}`}
-            dur="1.3s"
-            repeatCount="indefinite"
-          />
-        </circle>
         <text x="50%" y="50%" textAnchor="middle" dominantBaseline="central" fontSize={fontPct} fontWeight="700" fill="#eef7f5">
           {pct}%
         </text>
       </svg>
-      <div
-        style={{
-          fontSize: fontLabel,
-          fontWeight: 700,
-          color: active ? color : "#dceeec",
-          textAlign: "center",
-          lineHeight: 1.25,
-          maxWidth: size + 60,
-        }}
-      >
+      <div style={{ fontSize: fontLabel, fontWeight: 700, color: active ? color : "#dceeec", textAlign: "center", marginTop: 4 }}>
         {area}
       </div>
-      <div style={{ fontSize: fontCount, color: "#9db3b0" }}>{total} carpetas</div>
+      <div style={{ fontSize: fontCount, color: "#9db3b0", fontWeight: 700 }}>{total} carpetas</div>
+      {tamano && (
+        <div style={{ fontSize: 14, textAlign: "center", display: "flex", gap: 12, marginTop: 6 }}>
+          <span style={{ color: "#f39c12", fontWeight: 700 }}>{incompletas} inc.</span>
+          <span style={{ color: "#e74c3c", fontWeight: 700 }}>{vacias} vacías</span>
+        </div>
+      )}
     </button>
   );
 }
 
 function AreaProgressPanel({ area, stats, color }) {
-  const pct = stats.total > 0 ? Math.round((stats.completas / stats.total) * 100) : 0;
-  const pctArchivos =
-    stats.archivosNecesarios > 0 ? Math.round((stats.archivosCompletados / stats.archivosNecesarios) * 100) : 0;
-  const size = 96;
-  const stroke = 9;
-  const radius = (size - stroke) / 2;
-  const circumference = 2 * Math.PI * radius;
-  const offset = circumference - (pctArchivos / 100) * circumference;
-
   return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 20,
-        background: "#0e2529",
-        border: `1px solid ${color}44`,
-        borderRadius: 10,
-        padding: "16px 20px",
-        marginBottom: 12,
-      }}
-    >
-      <svg width={size} height={size} style={{ flexShrink: 0 }}>
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={radius}
-          fill="none"
-          stroke="#1f4a4a"
-          strokeWidth={stroke}
-        />
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={radius}
-          fill="none"
-          stroke={color}
-          strokeWidth={stroke}
-          strokeLinecap="round"
-          strokeDasharray={circumference}
-          strokeDashoffset={offset}
-          transform={`rotate(-90 ${size / 2} ${size / 2})`}
-          style={{ transition: "stroke-dashoffset .5s ease" }}
-        />
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={radius}
-          fill="none"
-          stroke="#eef7f5"
-          strokeWidth={Math.max(2, stroke * 0.28)}
-          strokeLinecap="round"
-          strokeDasharray={`${circumference * 0.09} ${circumference * 0.91}`}
-          opacity="0.75"
-        >
-          <animateTransform
-            attributeName="transform"
-            type="rotate"
-            from={`0 ${size / 2} ${size / 2}`}
-            to={`360 ${size / 2} ${size / 2}`}
-            dur="1.3s"
-            repeatCount="indefinite"
-          />
-        </circle>
-        <text
-          x="50%"
-          y="50%"
-          textAnchor="middle"
-          dominantBaseline="central"
-          fontSize="20"
-          fontWeight="700"
-          fill="#eef7f5"
-        >
-          {pctArchivos}%
-        </text>
-      </svg>
-
+    <div style={{ display: "flex", alignItems: "center", gap: 20, background: "#0e2529", border: `1px solid ${color}44`, borderRadius: 10, padding: "16px 20px", marginBottom: 12 }}>
       <div>
         <div style={{ fontSize: 14, fontWeight: 700, color, marginBottom: 6 }}>{area}</div>
-        <div style={{ fontSize: 12, color: "#dceeec", lineHeight: 1.7 }}>
-          <div>
-            <span style={{ color: "#2ecc71", fontWeight: 700 }}>{stats.completas}</span> completas de{" "}
-            <strong>{stats.total}</strong> carpetas
-          </div>
-          <div>
-            <span style={{ color: "#f39c12", fontWeight: 700 }}>{stats.incompletas}</span> incompletas
-            {"  ·  "}
-            <span style={{ color: "#e74c3c", fontWeight: 700 }}>{stats.vacias}</span> vacías
-          </div>
-          {stats.archivosNecesarios > 0 && (
-            <div style={{ marginTop: 4, paddingTop: 4, borderTop: "1px solid #1f4a4a" }}>
-              <span style={{ color: "#2dd4bf", fontWeight: 700 }}>{pctArchivos}%</span>{" "}
-              <span style={{ color: "#8fa8a8" }}>
-                por archivos ({stats.archivosCompletados} de {stats.archivosNecesarios})
-              </span>
-            </div>
-          )}
+        <div style={{ fontSize: 12, color: "#eef7f5", lineHeight: 1.7 }}>
+          <div><span style={{ color: "#2ecc71", fontWeight: 700 }}>{stats.completas}</span> completas de <strong>{stats.total}</strong> carpetas</div>
+          <div><span style={{ color: "#f39c12", fontWeight: 700 }}>{stats.incompletas}</span> incompletas · <span style={{ color: "#e74c3c", fontWeight: 700 }}>{stats.vacias}</span> vacías</div>
         </div>
       </div>
     </div>
   );
 }
 
-// Mini dona de progreso (completas vs total), para meter dentro del header de cada grupo
 function MiniDona({ completas, total }) {
   const size = 22;
   const stroke = 4;
@@ -1755,7 +1561,7 @@ function MiniDona({ completas, total }) {
   const color = pct >= 1 ? "#2ecc71" : pct > 0 ? "#f39c12" : "#e74c3c";
 
   return (
-    <svg width={size} height={size} title={`${completas} de ${total} completas`}>
+    <svg width={size} height={size}>
       <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#bcdcd8" strokeWidth={stroke} />
       <circle
         cx={size / 2}
@@ -1786,17 +1592,6 @@ function chipStyle(active, color) {
   };
 }
 
-const selectStyle = {
-  background: "#0e2529",
-  color: "#eef7f5",
-  border: "1px solid #2b5c5c",
-  borderRadius: 6,
-  padding: "6px 10px",
-  fontSize: 12,
-};
-
-// Hook chiquito: anima un número de su valor anterior al nuevo, tipo "contador".
-// Si el valor no es numérico (ej. "–" mientras carga), lo muestra directo sin animar.
 function useCountUp(target) {
   const [display, setDisplay] = useState(target);
   const prevRef = useRef(target);
@@ -1818,7 +1613,7 @@ function useCountUp(target) {
     let raf;
     function tick(ahora) {
       const t = Math.min(1, (ahora - inicio) / duracion);
-      const suavizado = 1 - Math.pow(1 - t, 3); // ease-out cúbico
+      const suavizado = 1 - Math.pow(1 - t, 3);
       setDisplay(Math.round(from + (to - from) * suavizado));
       if (t < 1) {
         raf = requestAnimationFrame(tick);
@@ -1854,19 +1649,17 @@ function Card({ label, value, color, grande }) {
   );
 }
 
-// Gráfico de línea (SVG a mano, sin librerías) mostrando el % de avance día a
-// día (colección "historial"), CON eje X de fechas, eje Y de porcentaje, y las
-// incidencias reales del Drive de cada día (mismo dato que el calendario de
-// actividad) como mini-barras debajo de la línea — para que ambos gráficos
-// cuenten la misma historia, solo que de forma distinta.
 function TendenciaChart({ historial, grande, actividadPorDia }) {
-  const altoLinea = grande ? 320 : 260;
-  const altoBarras = grande ? 80 : 62; // franja de incidencias del Drive, debajo de la línea
+  const altoLinea = grande ? 420 : 280;
+  const altoBarras = grande ? 100 : 70;
   const alto = altoLinea + altoBarras;
-  const ancho = 600; // viewBox — el SVG escala solo al ancho real del contenedor
-  const paddingIzq = 42;
-  const paddingDer = 18;
-  const paddingArriba = 20;
+  
+  const anchoPunto = grande ? 65 : 55; // Separación amplia para evitar amontonamientos
+  const paddingIzq = 60;
+  const paddingDer = 40;
+  const anchoMinimo = grande ? 960 : 720;
+  const ancho = Math.max(anchoMinimo, paddingIzq + paddingDer + historial.length * anchoPunto);
+  const paddingArriba = 24;
 
   return (
     <div
@@ -1874,23 +1667,23 @@ function TendenciaChart({ historial, grande, actividadPorDia }) {
         background: "#0e2529",
         border: "1px solid #2b5c5c",
         borderRadius: 12,
-        padding: "16px 18px",
+        padding: grande ? "28px 32px" : "16px 18px",
       }}
     >
-      <div style={{ fontSize: 14, fontWeight: 700, color: "#dceeec", marginBottom: 10 }}>
-        📈 Tendencia de avance {historial.length > 0 ? `(últimos ${historial.length} días)` : ""}
+      <div style={{ fontSize: grande ? 20 : 15, fontWeight: 700, color: "#dceeec", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span>📈 Tendencia de avance {historial.length > 0 ? `(${historial.length} días)` : ""}</span>
+        <span style={{ fontSize: 11, color: "#8fa8a8", fontWeight: 400 }}>Desliza horizontalmente ↔</span>
       </div>
 
       {historial.length < 2 ? (
         <div style={{ fontSize: 12, color: "#8fa8a8", padding: "20px 0" }}>
-          Todavía no hay suficiente historial — este gráfico se va llenando con cada sincronización diaria.
+          Todavía no hay suficiente historial.
         </div>
       ) : (
         (() => {
           const puntos = historial.map((h, i) => {
-            const x = paddingIzq + (i / (historial.length - 1)) * (ancho - paddingIzq - paddingDer);
+            const x = paddingIzq + i * anchoPunto;
             const y = paddingArriba + altoLinea - paddingArriba - (h.pct / 100) * (altoLinea - paddingArriba * 2);
-            // Incidencias del Drive ese día — mismo dato que el calendario de actividad
             const tiposDia = actividadPorDia?.[h.fecha] || {};
             const incidencias = Object.values(tiposDia).reduce((s, n) => s + n, 0);
             return { x, y, pct: h.pct, fecha: h.fecha, incidencias };
@@ -1902,148 +1695,113 @@ function TendenciaChart({ historial, grande, actividadPorDia }) {
             ` L ${puntos[puntos.length - 1].x} ${altoLinea - paddingArriba} Z`;
 
           const maxIncidencias = Math.max(1, ...puntos.map((p) => p.incidencias));
-          const yBaseBarras = altoLinea + altoBarras - 14; // deja espacio abajo para la etiqueta de fecha
-
-          // Cuántas etiquetas de fecha mostrar en el eje X sin que se amontonen
-          const maxEtiquetas = grande ? 10 : 6;
-          const pasoEtiqueta = Math.max(1, Math.ceil(puntos.length / maxEtiquetas));
+          const yBaseBarras = altoLinea + altoBarras - 16;
+          const pasoEtiqueta = 1;
 
           return (
-            <svg viewBox={`0 0 ${ancho} ${alto}`} style={{ width: "100%", height: alto, display: "block" }}>
-              {/* Eje Y — líneas guía + etiquetas de % */}
-              {[0, 25, 50, 75, 100].map((v) => {
-                const y = paddingArriba + altoLinea - paddingArriba - (v / 100) * (altoLinea - paddingArriba * 2);
-                return (
-                  <g key={v}>
-                    <line x1={paddingIzq} y1={y} x2={ancho - paddingDer} y2={y} stroke="#2b5c5c" strokeWidth="1" strokeDasharray="3,4" />
-                    <text x={paddingIzq - 6} y={y + 3} textAnchor="end" fontSize="11" fill="#8fa8a8" fontWeight="600">
-                      {v}%
+            <div style={{ overflowX: "auto", overflowY: "hidden", width: "100%", paddingBottom: 8, scrollbarWidth: "thin", scrollbarColor: "#2b5c5c #0e2529" }}>
+              <svg viewBox={`0 0 ${ancho} ${alto}`} style={{ width: `${ancho}px`, height: `${alto}px`, display: "block" }}>
+                {[0, 25, 50, 75, 100].map((v) => {
+                  const y = paddingArriba + altoLinea - paddingArriba - (v / 100) * (altoLinea - paddingArriba * 2);
+                  return (
+                    <g key={v}>
+                      <line x1={paddingIzq - 10} y1={y} x2={ancho - paddingDer} y2={y} stroke="#2b5c5c" strokeWidth="1" strokeDasharray="3,4" />
+                      <text x={paddingIzq - 16} y={y + 4} textAnchor="end" fontSize={grande ? 14 : 12} fill="#8fa8a8" fontWeight="600">
+                        {v}%
+                      </text>
+                    </g>
+                  );
+                })}
+
+                <path d={pathArea} fill="url(#tendenciaGradient)" opacity="0.4" />
+                <path
+                  d={pathLinea}
+                  fill="none"
+                  stroke="#17a398"
+                  strokeWidth={grande ? "4.5" : "3.5"}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                {puntos.map((p, i) => (
+                  <circle key={i} cx={p.x} cy={p.y} r={i === puntos.length - 1 ? (grande ? 7 : 5.5) : (grande ? 5 : 3.5)} fill="#17a398" />
+                ))}
+
+                <defs>
+                  <linearGradient id="tendenciaGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#17a398" />
+                    <stop offset="100%" stopColor="#17a398" stopOpacity="0" />
+                  </linearGradient>
+                </defs>
+
+                <text x={puntos[puntos.length - 1].x} y={puntos[puntos.length - 1].y - 14} textAnchor="end" fontSize={grande ? 18 : 15} fontWeight="700" fill="#7fe0d4">
+                  {puntos[puntos.length - 1].pct}%
+                </text>
+
+                <line x1={paddingIzq - 10} y1={altoLinea + 8} x2={ancho - paddingDer} y2={altoLinea + 8} stroke="#1f4a4a" strokeWidth="1" />
+                <text x={paddingIzq} y={altoLinea + 18} fontSize={grande ? 12 : 11} fill="#8fa8a8" fontWeight="700">
+                  INCIDENCIAS DEL DRIVE POR DÍA
+                </text>
+                {puntos.map((p, i) => {
+                  const alturaBarrita = Math.max(3, (p.incidencias / maxIncidencias) * (altoBarras - 28));
+                  return (
+                    <rect
+                      key={i}
+                      x={p.x - 4}
+                      y={yBaseBarras - alturaBarrita}
+                      width="8"
+                      height={alturaBarrita}
+                      rx="2"
+                      fill={p.incidencias > 0 ? "#2dd4bf" : "#1f4a4a"}
+                    />
+                  );
+                })}
+                {puntos.map((p, i) => {
+                  if (i % pasoEtiqueta !== 0 && i !== puntos.length - 1) return null;
+                  const fechaObj = new Date(p.fecha + "T12:00:00");
+                  const etiqueta = isNaN(fechaObj.getTime())
+                    ? p.fecha
+                    : fechaObj.toLocaleDateString("es-PE", { day: "numeric", month: "short" });
+                  return (
+                    <text key={i} x={p.x} y={alto - 2} textAnchor="middle" fontSize={grande ? 13 : 11} fill="#c8e8e5" fontWeight="600">
+                      {etiqueta}
                     </text>
-                  </g>
-                );
-              })}
-
-              <path d={pathArea} fill="url(#tendenciaGradient)" opacity="0.35" />
-              <path
-                d={pathLinea}
-                fill="none"
-                stroke="#17a398"
-                strokeWidth="2.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeDasharray="3000"
-                strokeDashoffset="3000"
-                style={{ animation: "chijnayaDibujarLinea 1.4s ease forwards" }}
-              />
-              {puntos.map((p, i) => (
-                <circle key={i} cx={p.x} cy={p.y} r={i === puntos.length - 1 ? 4.5 : 2.5} fill="#17a398">
-                  <title>{`${formatearFechaLarga(p.fecha)} — ${p.pct}% de avance · ${p.incidencias} incidencia${p.incidencias !== 1 ? "s" : ""} en Drive`}</title>
-                </circle>
-              ))}
-              {/* Punto que pulsa sin parar sobre el último valor, para que se sienta "vivo" */}
-              <circle cx={puntos[puntos.length - 1].x} cy={puntos[puntos.length - 1].y} r="4.5" fill="none" stroke="#2dd4bf" strokeWidth="2">
-                <animate attributeName="r" values="4.5;13;4.5" dur="2.2s" repeatCount="indefinite" />
-                <animate attributeName="opacity" values="0.9;0;0.9" dur="2.2s" repeatCount="indefinite" />
-              </circle>
-              {/* Punto brillante que recorre toda la línea sin parar */}
-              <circle r="4" fill="#eef7f5">
-                <animateMotion dur="3.4s" repeatCount="indefinite" path={pathLinea} />
-              </circle>
-              <defs>
-                <linearGradient id="tendenciaGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#17a398" />
-                  <stop offset="100%" stopColor="#17a398" stopOpacity="0" />
-                </linearGradient>
-              </defs>
-              {/* etiqueta del último valor */}
-              <text x={puntos[puntos.length - 1].x} y={puntos[puntos.length - 1].y - 10} textAnchor="end" fontSize="13" fontWeight="700" fill="#7fe0d4">
-                {puntos[puntos.length - 1].pct}%
-              </text>
-
-              {/* Franja inferior: incidencias del Drive por día (mismo dato que el calendario) + eje X de fechas */}
-              <line x1={paddingIzq} y1={altoLinea + 6} x2={ancho - paddingDer} y2={altoLinea + 6} stroke="#1f4a4a" strokeWidth="1" />
-              <text x={paddingIzq} y={altoLinea + 15} fontSize="10" fill="#8fa8a8" fontWeight="700">
-                INCIDENCIAS DEL DRIVE POR DÍA
-              </text>
-              {puntos.map((p, i) => {
-                const alturaBarrita = Math.max(2, (p.incidencias / maxIncidencias) * (altoBarras - 24));
-                return (
-                  <rect
-                    key={i}
-                    x={p.x - 2.5}
-                    y={yBaseBarras - alturaBarrita}
-                    width="5"
-                    height={alturaBarrita}
-                    rx="1.5"
-                    fill={p.incidencias > 0 ? "#2dd4bf" : "#1f4a4a"}
-                  >
-                    <title>{`${formatearFechaLarga(p.fecha)} — ${p.incidencias} incidencia${p.incidencias !== 1 ? "s" : ""} en Drive`}</title>
-                  </rect>
-                );
-              })}
-              {puntos.map((p, i) => {
-                if (i % pasoEtiqueta !== 0 && i !== puntos.length - 1) return null;
-                const fechaObj = new Date(p.fecha + "T12:00:00");
-                const etiqueta = isNaN(fechaObj.getTime())
-                  ? p.fecha
-                  : fechaObj.toLocaleDateString("es-PE", { day: "numeric", month: "short" });
-                return (
-                  <text key={i} x={p.x} y={alto - 2} textAnchor="middle" fontSize="10.5" fill="#c8e8e5" fontWeight="600">
-                    {etiqueta}
-                  </text>
-                );
-              })}
-            </svg>
+                  );
+                })}
+              </svg>
+            </div>
           );
         })()
       )}
-      <style>{`
-        @keyframes chijnayaDibujarLinea {
-          to { stroke-dashoffset: 0; }
-        }
-        @media (prefers-reduced-motion: reduce) {
-          path[style] { animation: none !important; stroke-dashoffset: 0 !important; }
-        }
-      `}</style>
     </div>
   );
 }
 
-// Mapa de calor tipo GitHub — cuadraditos por día mostrando cuánta actividad hubo
-// (subidas, reemplazos, borrados, etc.), usando la colección "eventos".
-function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoId }) {
-  const DIAS = grande ? 119 : 84; // ~17 o ~12 semanas
-  const [tooltip, setTooltip] = useState(null); // {anclaX, anclaY, texto} o null
-  const [tooltipPos, setTooltipPos] = useState(null); // {left, top} ya con el ancho real medido
+function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
+  const DIAS = diasCustom;
+  const [tooltip, setTooltip] = useState(null);
+  const [tooltipPos, setTooltipPos] = useState(null);
   const tooltipRef = useRef(null);
+  const [diaSeleccionado, setDiaSeleccionado] = useState(null);
+  const [eventosDelDia, setEventosDelDia] = useState(null);
 
   useEffect(() => {
     if (!tooltip) {
       setTooltipPos(null);
       return;
     }
-    // Se mide el tooltip DESPUÉS de que ya está en el DOM (aunque invisible),
-    // para conocer su ancho REAL — así nunca se corta, sin importar qué tan
-    // larga sea la fecha o si el cuadrado está pegado al borde de la pantalla.
     const el = tooltipRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     let left = tooltip.anclaX - rect.width / 2;
     left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, left));
     let top = tooltip.anclaY - rect.height - 10;
-    if (top < 8) top = tooltip.anclaY + 18; // si no cabe arriba, se muestra abajo del cuadrado
+    if (top < 8) top = tooltip.anclaY + 18;
     setTooltipPos({ left, top });
   }, [tooltip]);
-
-  const [diaSeleccionado, setDiaSeleccionado] = useState(null); // {key, fecha, count} o null
-  const [eventosDelDia, setEventosDelDia] = useState(null); // null = cargando, [] = sin eventos, [...] = lista
-  const contenedorRef = useRef(null);
 
   const hoy = new Date();
   hoy.setHours(0, 0, 0, 0);
 
-  // conteoPorDia y conteoPorTipo salen directo del documento agregado
-  // (ej. { "2026-08-13": { subido: 400, borrado: 100 }, ... })
   const conteoPorDia = {};
   const conteoPorTipoTotal = {};
   for (const [fechaKey, tipos] of Object.entries(actividadPorDia || {})) {
@@ -2063,9 +1821,6 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
     dias.push({ key, count: conteoPorDia[key] || 0, fecha: d });
   }
 
-  // Umbrales FIJOS (no relativos al día con más actividad) — así un día con una
-  // ráfaga grande (ej. un sync con cientos de archivos) no "aplasta" la escala
-  // y hace que los demás días con actividad normal se vean todos iguales a "sin actividad".
   function intensidad(count) {
     if (count === 0) return "#1f4a4a";
     if (count >= 11) return "#2dd4bf";
@@ -2073,7 +1828,6 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
     return "#0e7c72";
   }
 
-  // Agrupar en semanas (columnas) para el layout tipo GitHub
   const semanas = [];
   for (let i = 0; i < dias.length; i += 7) {
     semanas.push(dias.slice(i, i + 7));
@@ -2081,21 +1835,12 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
 
   const celda = grande ? 30 : 17;
   const gap = grande ? 7 : 4;
+  const tiposOrdenados = Object.keys(conteoPorTipoTotal).sort((a, b) => conteoPorTipoTotal[b] - conteoPorTipoTotal[a]);
 
-  // Resumen de eventos por tipo dentro de la ventana visible, para llenar el
-  // espacio sobrante junto al calendario con información real (no solo relleno visual)
-  const conteoPorTipo = conteoPorTipoTotal;
-  const tiposOrdenados = Object.keys(conteoPorTipo).sort((a, b) => conteoPorTipo[b] - conteoPorTipo[a]);
-  const diaMasActivo = dias.reduce((max, d) => (d.count > (max?.count || 0) ? d : max), null);
-
-  // Consulta bajo demanda (solo al hacer click, no de fondo) todos los eventos
-  // reales de Drive que caen en un día específico, en HORA DE LIMA.
   async function abrirDetalleDia(d) {
     setDiaSeleccionado(d);
-    setEventosDelDia(null); // "cargando"
+    setEventosDelDia(null);
     try {
-      // Lima es UTC-5 todo el año (sin horario de verano) — medianoche en Lima
-      // del día "d.key" equivale a las 05:00 UTC de ese mismo día.
       const inicioUTC = new Date(`${d.key}T05:00:00.000Z`);
       const finUTC = new Date(inicioUTC.getTime() + 24 * 60 * 60 * 1000);
       const q = query(
@@ -2106,7 +1851,7 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
       );
       const snap = await getDocs(q);
       setEventosDelDia(snap.docs.map((doc) => ({ id: doc.id, ...doc.data() })));
-    } catch (err) {
+    } catch {
       setEventosDelDia([]);
     }
   }
@@ -2126,7 +1871,7 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
         overflowX: "auto",
       }}
     >
-      <div style={{ fontSize: grande ? 17 : 14, fontWeight: 700, color: "#dceeec", marginBottom: grande ? 18 : 10 }}>
+      <div style={{ fontSize: grande ? 18 : 14, fontWeight: 700, color: "#dceeec", marginBottom: grande ? 18 : 10 }}>
         🔥 Actividad ({DIAS} días)
       </div>
       <div style={{ display: "flex", gap: grande ? 40 : 20, alignItems: "flex-start", flexWrap: "wrap" }}>
@@ -2135,7 +1880,7 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
             <div key={si} style={{ display: "flex", flexDirection: "column", gap: gap }}>
               {semana.map((d, di) => {
                 const esHoy = d.key === fechaLimaISO(new Date());
-                const textoTooltip = `${formatearFechaLarga(d.fecha)}${esHoy ? " (hoy)" : ""} — ${d.count} evento${d.count !== 1 ? "s" : ""} · click para ver detalle`;
+                const textoTooltip = `${formatearFechaLarga(d.fecha)}${esHoy ? " (hoy)" : ""} — ${d.count} evento${d.count !== 1 ? "s" : ""}`;
                 return (
                   <div
                     key={d.key}
@@ -2158,7 +1903,6 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
           ))}
         </div>
 
-        {/* Columna al costado: resumen del período (si hay datos) + leyenda de colores, siempre visible */}
         <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 240 }}>
           {tiposOrdenados.length > 0 && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -2184,58 +1928,15 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
                   >
                     {EVENTO_ICONO[tipo] || "•"}
                   </span>
-                  <strong>{conteoPorTipo[tipo]}</strong>
+                  <strong>{conteoPorTipoTotal[tipo]}</strong>
                   <span style={{ color: "#b7c9c6" }}>{EVENTO_LABEL[tipo] || tipo}</span>
                 </div>
               ))}
-              {diaMasActivo && diaMasActivo.count > 0 && (
-                <div style={{ fontSize: 12.5, color: "#8fa8a8", marginTop: 2, paddingTop: 10, borderTop: "1px solid #1f4a4a" }}>
-                  Día más activo: <strong style={{ color: "#dceeec" }}>{diaMasActivo.fecha.toLocaleDateString("es-PE")}</strong> ({diaMasActivo.count} eventos)
-                </div>
-              )}
             </div>
           )}
-
-          {/* Leyenda de colores — en lista vertical, al costado del calendario */}
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: grande ? 12 : 9,
-              paddingTop: tiposOrdenados.length > 0 ? 14 : 0,
-              borderTop: tiposOrdenados.length > 0 ? "1px solid #1f4a4a" : "none",
-            }}
-          >
-            <div style={{ fontSize: grande ? 15 : 13.5, fontWeight: 700, color: "#9db3b0", textTransform: "uppercase", letterSpacing: 0.4 }}>
-              Intensidad
-            </div>
-            {[
-              { label: "Sin actividad", color: "#1f4a4a" },
-              { label: "Baja", color: "#0e7c72" },
-              { label: "Media", color: "#17a398" },
-              { label: "Alta", color: "#2dd4bf" },
-            ].map((nivel) => (
-              <div key={nivel.label} style={{ display: "flex", alignItems: "center", gap: 12, fontSize: grande ? 17 : 15 }}>
-                <div
-                  style={{
-                    width: grande ? 24 : 20,
-                    height: grande ? 24 : 20,
-                    borderRadius: 5,
-                    background: nivel.color,
-                    flexShrink: 0,
-                  }}
-                />
-                <span style={{ color: "#dceeec", fontWeight: 500 }}>{nivel.label}</span>
-              </div>
-            ))}
-            <div style={{ fontSize: grande ? 13 : 12, color: "#8fa8a8", marginTop: 6, maxWidth: 240, lineHeight: 1.4 }}>
-              Cada cuadro es un día. Más brillante = más eventos ese día.
-            </div>
-          </div>
         </div>
       </div>
 
-      {/* Tooltip flotante — ancho fijo, el texto se envuelve en 2-3 líneas en vez de una línea larga */}
       {tooltip && (
         <div
           ref={tooltipRef}
@@ -2252,10 +1953,7 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
             fontSize: 11.5,
             fontWeight: 600,
             width: 150,
-            lineHeight: 1.4,
-            textAlign: "center",
             zIndex: 200,
-            boxShadow: "0 6px 18px rgba(0,0,0,.5)",
             pointerEvents: "none",
           }}
         >
@@ -2263,15 +1961,14 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
         </div>
       )}
 
-      {/* Modal: detalle de incidencias de un día específico, no interfiere con la ventana principal */}
       {diaSeleccionado && (
         <div
           onClick={() => setDiaSeleccionado(null)}
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(2,10,11,.75)",
-            backdropFilter: "blur(3px)",
+            background: "rgba(2,10,11,.8)",
+            backdropFilter: "blur(4px)",
             zIndex: 150,
             display: "flex",
             alignItems: "center",
@@ -2286,11 +1983,11 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
               background: "#0e2529",
               border: "1px solid #2b5c5c",
               borderRadius: 16,
-              width: "min(600px, 100%)",
-              maxHeight: "80vh",
+              width: "min(750px, 100%)",
+              maxHeight: "85vh",
               display: "flex",
               flexDirection: "column",
-              boxShadow: "0 20px 60px rgba(0,0,0,.5)",
+              boxShadow: "0 20px 60px rgba(0,0,0,.6)",
             }}
           >
             <div
@@ -2298,23 +1995,23 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
-                padding: "16px 20px",
+                padding: "20px 26px",
                 borderBottom: "1px solid #1f4a4a",
               }}
             >
               <div>
-                <div style={{ fontSize: 15, fontWeight: 700, color: "#dceeec" }}>
-                  {formatearFechaLarga(diaSeleccionado.fecha)}
+                <div style={{ fontSize: 18, fontWeight: 700, color: "#dceeec" }}>
+                  Actividad del {formatearFechaLarga(diaSeleccionado.fecha)}
                 </div>
                 <div style={{ fontSize: 12, color: "#8fa8a8", marginTop: 2 }}>
-                  {diaSeleccionado.count} evento{diaSeleccionado.count !== 1 ? "s" : ""} ese día
+                  {diaSeleccionado.count} evento{diaSeleccionado.count !== 1 ? "s" : ""} registrado{diaSeleccionado.count !== 1 ? "s" : ""}
                 </div>
               </div>
               <button
                 onClick={() => setDiaSeleccionado(null)}
                 style={{
-                  fontSize: 13,
-                  padding: "6px 12px",
+                  fontSize: 14,
+                  padding: "7px 14px",
                   borderRadius: 8,
                   border: "1px solid #2b5c5c",
                   background: "transparent",
@@ -2325,83 +2022,71 @@ function ActividadHeatmap({ actividadPorDia, grande, onMarcarCompleta, marcandoI
                 ✕ Cerrar
               </button>
             </div>
-            <div style={{ overflowY: "auto", padding: "14px 20px 20px" }}>
+            <div style={{ overflowY: "auto", padding: "16px 26px 26px", flex: 1 }}>
               {eventosDelDia === null ? (
-                <div style={{ color: "#8fa8a8", fontSize: 13, padding: "20px 0", textAlign: "center" }}>
-                  Cargando...
+                <div style={{ textAlign: "center", padding: "40px 0", color: "#8fa8a8" }}>
+                  Cargando eventos del día...
                 </div>
               ) : eventosDelDia.length === 0 ? (
-                <div style={{ color: "#8fa8a8", fontSize: 13, padding: "20px 0", textAlign: "center" }}>
-                  No hay incidencias registradas para este día.
+                <div style={{ textAlign: "center", padding: "40px 0", color: "#8fa8a8" }}>
+                  No se encontraron eventos detallados para esta fecha.
                 </div>
               ) : (
-                eventosDelDia.map((e) => {
-                  const color = EVENTO_COLOR[e.tipo] || "#9db3b0";
-                  const icono = EVENTO_ICONO[e.tipo] || "•";
-                  const fecha = e.timestamp?.toDate ? e.timestamp.toDate() : null;
-                  return (
-                    <div
-                      key={e.id}
-                      style={{
-                        display: "flex",
-                        gap: 10,
-                        padding: "10px 0",
-                        borderBottom: "1px solid #1f4a4a",
-                      }}
-                    >
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {eventosDelDia.map((ev) => {
+                    const color = EVENTO_COLOR[ev.tipo] || "#9db3b0";
+                    const icono = EVENTO_ICONO[ev.tipo] || "•";
+                    const fechaEv = ev.timestamp?.toDate ? ev.timestamp.toDate() : null;
+                    const horaStr = fechaEv ? fechaEv.toLocaleTimeString("es-PE", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+                    return (
                       <div
+                        key={ev.id}
                         style={{
-                          flexShrink: 0,
-                          width: 26,
-                          height: 26,
-                          borderRadius: "50%",
-                          background: color + "22",
-                          border: `1.5px solid ${color}`,
-                          color,
+                          background: "#0a1e20",
+                          border: "1px solid #1f4a4a",
+                          borderRadius: 10,
+                          padding: "12px 16px",
                           display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          fontSize: 13,
-                          fontWeight: 700,
+                          alignItems: "flex-start",
+                          gap: 12,
                         }}
                       >
-                        {icono}
-                      </div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 13 }}>
-                          <strong>{e.usuario}</strong> <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span>{" "}
-                          <strong>{e.item}</strong>
+                        <div
+                          style={{
+                            flexShrink: 0,
+                            width: 30,
+                            height: 30,
+                            borderRadius: "50%",
+                            background: color + "22",
+                            border: `1.5px solid ${color}`,
+                            color: color,
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            fontSize: 14,
+                            fontWeight: 700,
+                          }}
+                        >
+                          {icono}
                         </div>
-                        {e.motivo && (
-                          <div style={{ fontSize: 11.5, color: "#9db3b0", marginTop: 2, fontStyle: "italic" }}>"{e.motivo}"</div>
-                        )}
-                        <div style={{ fontSize: 11, color: "#9db3b0", marginTop: 2 }}>{e.ruta}</div>
-                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 4 }}>
-                          <div style={{ fontSize: 10, color: "#8fa8a8" }}>
-                            {fecha ? fecha.toLocaleTimeString("es-PE", { hour: "2-digit", minute: "2-digit" }) : ""}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 14, color: "#eef7f5" }}>
+                            <strong>{ev.usuario || "Usuario"}</strong> <span style={{ color }}>{EVENTO_LABEL[ev.tipo] || ev.tipo}</span> <strong style={{ color: "#7fe0d4" }}>{ev.item}</strong>
                           </div>
-                          {e.tipo === "carpeta_marcada_completa" && e.folderId && onMarcarCompleta && (
-                            <button
-                              onClick={() => onMarcarCompleta(e.folderId, false, e.item, e.ruta)}
-                              disabled={marcandoId === e.folderId}
-                              style={{
-                                fontSize: 10,
-                                padding: "3px 9px",
-                                borderRadius: 20,
-                                border: "1px solid #e74c3c66",
-                                background: "transparent",
-                                color: marcandoId === e.folderId ? "#5c7a78" : "#e88f86",
-                                cursor: marcandoId === e.folderId ? "not-allowed" : "pointer",
-                              }}
-                            >
-                              {marcandoId === e.folderId ? "..." : "✕ Desmarcar"}
-                            </button>
+                          {ev.ruta && (
+                            <div style={{ fontSize: 12, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
+                              📁 {ev.ruta}
+                            </div>
                           )}
+                          <div style={{ fontSize: 11, color: "#5b827f", marginTop: 6, display: "flex", justifyContent: "space-between" }}>
+                            <span>{ev.tipo}</span>
+                            <span>{horaStr}</span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                })
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
