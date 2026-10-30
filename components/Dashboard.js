@@ -12,7 +12,7 @@ import {
   where,
   getDocs,
 } from "firebase/firestore";
-import { generarReportePorArea, generarReporteConsolidadoGlobal } from "@/lib/exportarReporte";
+import { generarReportePorArea, generarReporteConsolidadoGlobal, generarReporteActividadDiaPDF } from "@/lib/exportarReporte";
 import { generarReporteExcelPorArea, generarListaSeparadoresExcel, generarListaGeneralExcel } from "@/lib/exportarExcel";
 import { LOGO_PUNO_BASE64 } from "@/lib/logoPuno";
 import {
@@ -61,6 +61,8 @@ const EVENTO_LABEL = {
   archivo_subido: "subió",
   archivo_reemplazado: "reemplazó",
   archivo_borrado: "borró",
+  archivo_movido: "movió",
+  archivo_copiado: "copió",
   carpeta_creada: "creó la carpeta",
   carpeta_borrada: "borró la carpeta",
   carpeta_movida: "movió la carpeta",
@@ -72,6 +74,8 @@ const EVENTO_COLOR = {
   archivo_subido: "#2ecc71",
   archivo_reemplazado: "#f39c12",
   archivo_borrado: "#e74c3c",
+  archivo_movido: "#6c8cff",
+  archivo_copiado: "#1fb5a0",
   carpeta_creada: "#17a398",
   carpeta_borrada: "#e74c3c",
   carpeta_movida: "#2e86ab",
@@ -83,6 +87,8 @@ const EVENTO_ICONO = {
   archivo_subido: "↑",
   archivo_reemplazado: "⟲",
   archivo_borrado: "✕",
+  archivo_movido: "⇄",
+  archivo_copiado: "⧉",
   carpeta_creada: "+",
   carpeta_borrada: "✕",
   carpeta_movida: "⇄",
@@ -1312,8 +1318,14 @@ export default function Dashboard() {
                       <div style={{ fontSize: 13 }}>
                         <strong>{e.usuario}</strong> <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span> <strong>{e.item}</strong>
                       </div>
+                      {(e.tipo === "archivo_movido" || e.tipo === "archivo_copiado" || e.tipo === "carpeta_movida") && (e.desde || e.ruta) && (
+                        <div style={{ fontSize: 10.5, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
+                          {e.desde ? <div>Desde: {e.desde}</div> : null}
+                          {e.ruta ? <div>Hacia: {e.ruta}</div> : null}
+                        </div>
+                      )}
                       <div style={{ fontSize: 10, color: "#8fa8a8", marginTop: 2 }}>
-                        {tiempoRelativo(fecha)}
+                        {fecha ? `${fecha.toLocaleString("es-PE", { timeZone: "America/Lima", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true })} · ` : ""}{tiempoRelativo(fecha)}
                       </div>
                     </div>
                   </div>
@@ -1821,6 +1833,8 @@ function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
   const tooltipRef = useRef(null);
   const [diaSeleccionado, setDiaSeleccionado] = useState(null);
   const [eventosDelDia, setEventosDelDia] = useState(null);
+  const [exportandoPdfDia, setExportandoPdfDia] = useState(false);
+  const [rangoHoras, setRangoHoras] = useState(0); // 0 = todo el día; 3 o 5 = solo las últimas N horas (solo hoy)
 
   useEffect(() => {
     if (!tooltip) {
@@ -1892,6 +1906,34 @@ function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
     } catch {
       setEventosDelDia([]);
     }
+  }
+
+  function exportarPdfDia() {
+    if (!diaSeleccionado || !eventosDelDia || eventosDelDia.length === 0) return;
+    // Rango opcional: solo las últimas 3 o 5 horas (solo aplica al día de hoy)
+    const esHoyDia = diaSeleccionado.key === fechaLimaISO(new Date());
+    const horas = esHoyDia ? rangoHoras : 0;
+    const desde = horas > 0 ? Date.now() - horas * 60 * 60 * 1000 : 0;
+    const lista = horas > 0
+      ? eventosDelDia.filter((ev) => ev.timestamp?.toDate && ev.timestamp.toDate().getTime() >= desde)
+      : eventosDelDia;
+    if (lista.length === 0) {
+      alert(`No hay actividad en las últimas ${horas} horas.`);
+      return;
+    }
+    const tituloFecha = horas > 0
+      ? `${formatearFechaLarga(diaSeleccionado.fecha)} — últimas ${horas} horas`
+      : formatearFechaLarga(diaSeleccionado.fecha);
+    setExportandoPdfDia(true);
+    setTimeout(() => {
+      try {
+        generarReporteActividadDiaPDF(tituloFecha, horas > 0 ? `${diaSeleccionado.key}_ultimas_${horas}h` : diaSeleccionado.key, lista, {});
+      } catch (err) {
+        alert(`No se pudo generar el PDF: ${err.message}`);
+      } finally {
+        setExportandoPdfDia(false);
+      }
+    }, 60);
   }
 
   function mostrarTooltip(e, texto) {
@@ -2045,20 +2087,59 @@ function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
                   {diaSeleccionado.count} evento{diaSeleccionado.count !== 1 ? "s" : ""} registrado{diaSeleccionado.count !== 1 ? "s" : ""}
                 </div>
               </div>
-              <button
-                onClick={() => setDiaSeleccionado(null)}
-                style={{
-                  fontSize: 14,
-                  padding: "7px 14px",
-                  borderRadius: 8,
-                  border: "1px solid #2b5c5c",
-                  background: "transparent",
-                  color: "#9db3b0",
-                  cursor: "pointer",
-                }}
-              >
-                ✕ Cerrar
-              </button>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                {diaSeleccionado.key === fechaLimaISO(new Date()) && (
+                  <select
+                    value={rangoHoras}
+                    onChange={(e) => setRangoHoras(Number(e.target.value))}
+                    style={{
+                      fontSize: 13,
+                      padding: "7px 10px",
+                      borderRadius: 8,
+                      border: "1px solid #17a398",
+                      background: "#0a1e20",
+                      color: "#dceeec",
+                      cursor: "pointer",
+                    }}
+                    title="Rango de horas que se exporta en el PDF"
+                  >
+                    <option value={0}>Todo el día</option>
+                    <option value={3}>Últimas 3 horas</option>
+                    <option value={5}>Últimas 5 horas</option>
+                  </select>
+                )}
+                <button
+                  onClick={exportarPdfDia}
+                  disabled={exportandoPdfDia || !eventosDelDia || eventosDelDia.length === 0}
+                  style={{
+                    fontSize: 14,
+                    fontWeight: 700,
+                    padding: "7px 14px",
+                    borderRadius: 8,
+                    border: "1px solid #17a398",
+                    background: "#17a39833",
+                    color: "#dceeec",
+                    cursor: exportandoPdfDia || !eventosDelDia || eventosDelDia.length === 0 ? "not-allowed" : "pointer",
+                    opacity: !eventosDelDia || eventosDelDia.length === 0 ? 0.5 : 1,
+                  }}
+                >
+                  {exportandoPdfDia ? "Generando PDF..." : "📄 Exportar PDF"}
+                </button>
+                <button
+                  onClick={() => setDiaSeleccionado(null)}
+                  style={{
+                    fontSize: 14,
+                    padding: "7px 14px",
+                    borderRadius: 8,
+                    border: "1px solid #2b5c5c",
+                    background: "transparent",
+                    color: "#9db3b0",
+                    cursor: "pointer",
+                  }}
+                >
+                  ✕ Cerrar
+                </button>
+              </div>
             </div>
             <div style={{ overflowY: "auto", padding: "16px 26px 26px", flex: 1 }}>
               {eventosDelDia === null ? (
@@ -2111,6 +2192,11 @@ function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
                           <div style={{ fontSize: 14, color: "#eef7f5" }}>
                             <strong>{ev.usuario || "Usuario"}</strong> <span style={{ color }}>{EVENTO_LABEL[ev.tipo] || ev.tipo}</span> <strong style={{ color: "#7fe0d4" }}>{ev.item}</strong>
                           </div>
+                          {ev.desde && (
+                            <div style={{ fontSize: 12, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
+                              Desde: {ev.desde}
+                            </div>
+                          )}
                           {ev.ruta && (
                             <div style={{ fontSize: 12, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
                               📁 {ev.ruta}
