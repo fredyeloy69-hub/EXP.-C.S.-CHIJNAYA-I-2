@@ -1316,7 +1316,7 @@ export default function Dashboard() {
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ fontSize: 13 }}>
-                        <strong>{e.usuario}</strong> <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span> <strong>{e.item}</strong>
+                        <strong>{e.usuario}</strong>{e.ultimoModificador && /^(No identificado|Desconocido)/.test(e.usuario || "") ? <span style={{ fontSize: 11, color: "#8fa8a8" }}> (última modificación en Drive: {e.ultimoModificador})</span> : null} <span style={{ color }}>{EVENTO_LABEL[e.tipo] || e.tipo}</span> <strong>{e.item}</strong>
                       </div>
                       {(e.tipo === "archivo_movido" || e.tipo === "archivo_copiado" || e.tipo === "carpeta_movida") && (e.desde || e.ruta) && (
                         <div style={{ fontSize: 10.5, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
@@ -2190,7 +2190,7 @@ function ActividadHeatmap({ actividadPorDia, diasCustom = 84, grande }) {
                         </div>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontSize: 14, color: "#eef7f5" }}>
-                            <strong>{ev.usuario || "Usuario"}</strong> <span style={{ color }}>{EVENTO_LABEL[ev.tipo] || ev.tipo}</span> <strong style={{ color: "#7fe0d4" }}>{ev.item}</strong>
+                            <strong>{ev.usuario || "Usuario"}</strong>{ev.ultimoModificador && /^(No identificado|Desconocido)/.test(ev.usuario || "") ? <span style={{ fontSize: 12, color: "#8fa8a8" }}> (última modificación en Drive: {ev.ultimoModificador})</span> : null} <span style={{ color }}>{EVENTO_LABEL[ev.tipo] || ev.tipo}</span> <strong style={{ color: "#7fe0d4" }}>{ev.item}</strong>
                           </div>
                           {ev.desde && (
                             <div style={{ fontSize: 12, color: "#8fa8a8", marginTop: 3, wordBreak: "break-all" }}>
